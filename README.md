@@ -52,6 +52,6 @@ tests/        C++ 和服务测试
 docs/         规则、API、提交和回放规范
 ```
 
-## 开发流程
+## 开发约定
 
-分支和代码审查约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。任何规则或 API 变化都必须同步修改 `docs/` 和对应测试。
+任何规则或 API 变化都必须同步修改 `docs/` 和对应测试。

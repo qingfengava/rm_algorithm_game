@@ -135,7 +135,7 @@ MATCH_ENDED
       "alive": true
     }
   },
-  "state_hash": "sha256:..."
+  "state_hash": "fnv1a64:0123456789abcdef"
 }
 ```
 
@@ -251,6 +251,7 @@ SANDBOX_VIOLATION
 - `seq` 从 0 或 1 开始，并且严格递增。
 - 事件顺序必须与裁判引擎结算顺序一致。
 - `state_after` 必须是该事件结算后的状态。
+- `state_hash` 使用固定字段顺序计算的 FNV-1a 64 位哈希，格式为 `fnv1a64:` 加 16 位小写十六进制数字。哈希输入包含完整障碍物地图、回合状态、行动方、双方无人机状态和比赛结束状态。
 - 比赛结束事件之后不能再有行动事件。
 - `ENEMY_DESTROYED` 事件之后必须紧跟 `MATCH_ENDED`。
 - `ROUND_LIMIT` 只能出现在第 20 回合蓝方第 3 次行动之后。

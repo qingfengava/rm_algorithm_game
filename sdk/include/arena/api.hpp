@@ -54,6 +54,8 @@ struct Action {
     static constexpr Action scout() {
         return {ActionType::Scout, Direction::North};
     }
+
+    friend bool operator==(const Action &, const Action &) = default;
 };
 
 struct DroneState {
@@ -62,6 +64,8 @@ struct DroneState {
     Plane plane;
     Direction facing;
     bool alive;
+
+    friend bool operator==(const DroneState &, const DroneState &) = default;
 };
 
 struct MatchStart {
@@ -89,6 +93,8 @@ enum class ActionEffect : std::uint8_t {
 
 struct ActionResult {
     ActionEffect effect;
+
+    friend bool operator==(const ActionResult &, const ActionResult &) = default;
 };
 
 struct ScanCell {
@@ -99,11 +105,15 @@ struct ScanCell {
     bool in_bounds;
     bool obstacle;
     bool enemy_present;
+
+    friend bool operator==(const ScanCell &, const ScanCell &) = default;
 };
 
 struct ScanResult {
     Plane plane;
     std::array<ScanCell, 9> cells;
+
+    friend bool operator==(const ScanResult &, const ScanResult &) = default;
 };
 
 struct Observation {
@@ -113,6 +123,8 @@ struct Observation {
     DroneState self;
     std::optional<ActionResult> previous_action;
     std::optional<ScanResult> previous_scan;
+
+    friend bool operator==(const Observation &, const Observation &) = default;
 };
 
 class Player {
