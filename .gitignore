@@ -1,0 +1,21 @@
+# CMake and compiler output
+/build/
+/cmake-build-*/
+compile_commands.json
+
+# Node and local tooling
+node_modules/
+npm-debug.log*
+.env
+.env.*
+!.env.example
+
+# Runtime data
+/data/
+/tmp/
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
