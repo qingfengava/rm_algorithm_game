@@ -28,8 +28,9 @@ extern "C" arena::Player* create_player();
 官方编译环境使用固定的 C++23 工具链：
 
 ```bash
-g++ -std=c++23 -O2 -pipe -I/opt/arena/include \
-    /opt/arena/runner/judge_main.cpp bot.cpp \
+g++ -std=c++23 -O2 -pipe -I/opt/arena/sdk/include \
+    -I/opt/arena/runner/include \
+    /opt/arena/runner/src/main.cpp /opt/arena/runner/src/protocol.cpp bot.cpp \
     -o bot_runner
 ```
 
@@ -97,6 +98,8 @@ g++ -std=c++23 -O2 -pipe -I/opt/arena/include \
   |
 沙箱启动测试
   |
+基础 bot 资格赛
+  |
 加入比赛队列
   |
 与其他当前有效算法交换红蓝方各比赛一次
@@ -112,6 +115,10 @@ g++ -std=c++23 -O2 -pipe -I/opt/arena/include \
 ```
 
 两场比赛使用相同地图。
+
+正式排队前，候选算法必须在固定资格地图上分别担任红方和蓝方，击败平台内置的基础 bot。两场资格赛都获胜才算通过；任意一场失败、平局、超时、崩溃或协议错误都会拒绝提交。资格赛只用于提交门槛，不计入排行榜战绩。
+
+资格赛的基础 bot 行为和固定地图见 [`docs/QUALIFICATION.md`](QUALIFICATION.md)。
 
 同一用户重新提交后，新提交成为该用户当前有效算法。历史提交的比赛记录可以保留，但历史提交不再参与当前排行榜。
 

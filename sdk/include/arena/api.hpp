@@ -75,6 +75,8 @@ struct MatchStart {
     std::uint8_t map_height;
     std::uint8_t max_rounds;
     std::uint8_t actions_per_turn;
+
+    friend bool operator==(const MatchStart &, const MatchStart &) = default;
 };
 
 enum class ActionEffect : std::uint8_t {

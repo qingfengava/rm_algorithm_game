@@ -1,0 +1,43 @@
+# 提交资格赛
+
+候选算法在进入正式排行榜前，必须先击败平台内置的基础 bot。
+
+资格赛固定执行两场：
+
+```text
+比赛 A：候选算法为红方，基础 bot 为蓝方
+比赛 B：基础 bot 为红方，候选算法为蓝方
+```
+
+候选算法必须两场都获胜。任意一场平局、失败、超时、崩溃或协议错误，提交都会被拒绝。资格赛不计入排行榜，也不会写入正式对战统计。
+
+资格地图固定为下平面无障碍、上平面 4 个障碍物：
+
+```text
+(0,0,Upper)
+(3,3,Upper)
+(1,1,Upper)
+(2,2,Upper)
+```
+
+这保证双方出生点可以正常移动，同时出生位置无法直接升到上平面，资格结果不会被随机地图种子改变。
+
+基础 bot 的策略故意保持简单，覆盖所有基础操作：
+
+```text
+每回合第 1 次行动：侦查
+每回合第 2 次行动：转向北方
+第 3 次行动按回合循环：升降、向出生外侧移动、开火
+```
+
+基础 bot 不会根据侦查结果建立复杂地图模型，也不会主动追踪敌方位置。它用于检查候选算法是否能正确完成基本的移动、转向、升降、开火和侦查流程。
+
+本地可以使用以下命令执行资格赛：
+
+```bash
+runner/build_submission.sh submission.zip ./candidate-runner
+build/arena_match_demo --qualify-red ./candidate-runner build/arena_baseline_runner
+build/arena_match_demo --qualify-blue build/arena_baseline_runner ./candidate-runner
+```
+
+提交脚本会自动构建基础 bot、执行两场资格赛，并在两场都通过后输出 `COMPILE_OK`。这里的 `./candidate-runner` 是上一步生成的候选 runner 可执行文件。
