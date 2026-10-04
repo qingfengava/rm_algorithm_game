@@ -56,11 +56,19 @@ void test_map_generation() {
     expect(first == second, "same map seed must generate the same map");
 
     for (const Cell obstacle : first.obstacles()) {
-        expect(!(obstacle.x == 0 && obstacle.y == 0 && obstacle.plane == Plane::Lower),
-               "red lower spawn cannot contain an obstacle");
-        expect(!(obstacle.x == 3 && obstacle.y == 3 && obstacle.plane == Plane::Lower),
-               "blue lower spawn cannot contain an obstacle");
+        const bool red_zone = obstacle.plane == Plane::Lower && obstacle.x <= 1 && obstacle.y <= 1;
+        const bool blue_zone = obstacle.plane == Plane::Lower && obstacle.x >= 2 && obstacle.y >= 2;
+        expect(!red_zone && !blue_zone, "spawn lower-plane 2x2 safe zones must be empty");
     }
+
+    const auto invalid_safe_zone_map = Map::from_obstacles({
+        Cell{1, 1, Plane::Lower},
+        Cell{0, 2, Plane::Lower},
+        Cell{2, 1, Plane::Lower},
+        Cell{0, 0, Plane::Upper},
+    });
+    expect(!invalid_safe_zone_map.has_value(),
+           "fixed maps must reject lower-plane spawn safe-zone obstacles");
 }
 
 void test_map_boundary() {
@@ -73,14 +81,17 @@ void test_map_boundary() {
 
 void test_obstacle_blocks_movement() {
     Match match(make_map({
-        Cell{1, 0, Plane::Lower},
+        Cell{2, 0, Plane::Lower},
         Cell{0, 1, Plane::Upper},
         Cell{1, 1, Plane::Upper},
         Cell{2, 2, Plane::Upper},
     }));
+    auto state = state_with_blue_at(3, 3);
+    state.red.x = 1;
+    match = Match::from_state_for_testing(match.map(), state);
     const auto outcome = match.apply(Action::move(Direction::East));
     expect(outcome.effect == ActionEffect::MoveBlocked, "obstacle must block movement");
-    expect(match.state().red.x == 0 && match.state().red.y == 0,
+    expect(match.state().red.x == 1 && match.state().red.y == 0,
            "obstacle collision must preserve position");
 }
 
@@ -147,23 +158,40 @@ void test_elevation_succeeds() {
 
 void test_scout_at_edge() {
     Match match(make_map({
-        Cell{1, 1, Plane::Lower},
+        Cell{1, 2, Plane::Lower},
         Cell{0, 1, Plane::Upper},
         Cell{1, 1, Plane::Upper},
         Cell{2, 2, Plane::Upper},
     }));
-    match = Match::from_state_for_testing(match.map(), state_with_blue_at(1, 0));
+    auto state = state_with_blue_at(1, 0);
+    state.red.x = 0;
+    state.red.y = 1;
+    state.blue.x = 1;
+    state.blue.y = 1;
+    match = Match::from_state_for_testing(match.map(), state);
 
     const auto outcome = match.apply(Action::scout());
     expect(outcome.effect == ActionEffect::Scanned, "scout must succeed at map edge");
     expect(outcome.scan.has_value(), "scout must return scan data");
     const auto &scan = *outcome.scan;
-    expect(!scan.cells[0].in_bounds && !scan.cells[1].in_bounds && !scan.cells[2].in_bounds,
-           "top row of edge scan must be out of bounds");
+    expect(!scan.cells[0].in_bounds && !scan.cells[3].in_bounds && !scan.cells[6].in_bounds,
+           "west cells of edge scan must be out of bounds");
     expect(scan.cells[5].enemy_present, "scan must report enemy in same plane");
     expect(scan.cells[8].obstacle, "scan must report obstacle in same plane");
     expect(scan.cells[8].dx == 1 && scan.cells[8].dy == 1,
            "scan cells must use documented ordering");
+}
+
+void test_move_to_enemy_is_blocked() {
+    auto state = state_with_blue_at(2, 0);
+    state.red.x = 1;
+    Match match = Match::from_state_for_testing(empty_lower_map(), state);
+
+    const auto outcome = match.apply(Action::move(Direction::East));
+    expect(outcome.effect == ActionEffect::MoveBlocked,
+           "a drone must not move into the enemy's cell");
+    expect(match.state().red.x == 1 && match.state().red.y == 0,
+           "enemy collision must preserve the moving drone's position");
 }
 
 void test_turn_and_red_three_actions() {
@@ -273,6 +301,7 @@ int main() {
         test_elevation_blocked_by_obstacle();
         test_elevation_succeeds();
         test_scout_at_edge();
+        test_move_to_enemy_is_blocked();
         test_turn_and_red_three_actions();
         test_blue_three_actions_advances_round();
         test_round_twenty_draw();

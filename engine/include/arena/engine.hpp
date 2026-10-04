@@ -135,7 +135,6 @@ class Match {
     explicit Match(std::uint64_t map_seed);
     explicit Match(Map map);
 
-    // Test fixtures may set a legal state without changing production match construction.
     static Match from_state_for_testing(Map map, GameState state);
 
     [[nodiscard]] const Map &map() const;

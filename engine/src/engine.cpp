@@ -59,6 +59,16 @@ bool cell_less(const Cell &left, const Cell &right) {
     return left.x < right.x;
 }
 
+bool in_spawn_safe_zone(Cell cell) {
+    if (cell.plane != Plane::Lower) {
+        return false;
+    }
+
+    const bool red_zone = cell.x >= 0 && cell.x <= 1 && cell.y >= 0 && cell.y <= 1;
+    const bool blue_zone = cell.x >= 2 && cell.x <= 3 && cell.y >= 2 && cell.y <= 3;
+    return red_zone || blue_zone;
+}
+
 std::optional<std::pair<int, int>> direction_delta(Direction direction) {
     switch (direction) {
     case Direction::North:
@@ -133,15 +143,14 @@ Map::Map(std::array<Cell, kObstacleCount> obstacles) : obstacles_(std::move(obst
 
 Map Map::generate(std::uint64_t seed) {
     std::vector<Cell> candidates;
-    candidates.reserve(30);
+    candidates.reserve(24);
 
     for (std::uint8_t plane = 0; plane < kPlaneCount; ++plane) {
         for (std::int8_t y = 0; y < kMapHeight; ++y) {
             for (std::int8_t x = 0; x < kMapWidth; ++x) {
-                const bool red_spawn = x == 0 && y == 0 && plane == 0;
-                const bool blue_spawn = x == 3 && y == 3 && plane == 0;
-                if (!red_spawn && !blue_spawn) {
-                    candidates.push_back({x, y, static_cast<Plane>(plane)});
+                const Cell cell{x, y, static_cast<Plane>(plane)};
+                if (!in_spawn_safe_zone(cell)) {
+                    candidates.push_back(cell);
                 }
             }
         }
@@ -169,8 +178,7 @@ std::optional<Map> Map::from_obstacles(const std::array<Cell, kObstacleCount> &o
         if (cell.x < 0 || cell.x >= kMapWidth || cell.y < 0 || cell.y >= kMapHeight) {
             return std::nullopt;
         }
-        if ((cell.x == 0 && cell.y == 0 && cell.plane == Plane::Lower) ||
-            (cell.x == 3 && cell.y == 3 && cell.plane == Plane::Lower)) {
+        if (in_spawn_safe_zone(cell)) {
             return std::nullopt;
         }
         for (std::size_t previous = 0; previous < index; ++previous) {
