@@ -11,9 +11,15 @@ async function main() {
     return body;
   }
 
-  const health = await getJson(`${apiUrl}/v1/health`);
+  const health = await getJson(`${apiUrl}/health`);
   if (health.status !== 'ok') {
     throw new Error(`API dependencies are not healthy: ${JSON.stringify(health)}`);
+  }
+
+  const leaderboard = await getJson(`${apiUrl}/leaderboard`);
+  const matches = await getJson(`${apiUrl}/matches`);
+  if (!Array.isArray(leaderboard.entries) || !Array.isArray(matches.matches)) {
+    throw new Error('API list endpoints returned invalid data');
   }
 
   const webResponse = await fetch(webUrl);

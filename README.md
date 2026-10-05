@@ -29,8 +29,8 @@ docker compose up --build
 
 ```text
 前端：http://localhost:8081
-API：http://localhost:8080/v1/health
-MinIO：http://localhost:9001
+API：http://localhost:8080/health
+对象存储（LocalStack S3）：http://localhost:4566
 ```
 
 运行源码检查：
@@ -51,6 +51,8 @@ infra/        Docker 和部署文件
 tests/        C++ 和服务测试
 docs/         规则、API、提交和回放规范
 ```
+
+API 基础服务、PostgreSQL/Redis/MinIO 数据流和上传验收见 [`docs/API.md`](docs/API.md)。
 
 ## 开发约定
 

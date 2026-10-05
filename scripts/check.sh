@@ -2,7 +2,12 @@
 set -euo pipefail
 
 node --check services/api/server.js
+node --check services/api/db.js
+node --check services/api/storage.js
+node --check services/api/provision_user.js
+node --check tests/api_integration.js
 node --check tests/smoke.js
+npm --prefix services/api test
 
 if command -v clang-format >/dev/null 2>&1; then
     clang-format --dry-run --Werror \

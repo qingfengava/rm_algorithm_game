@@ -12,11 +12,13 @@ docker compose up --build
 
 ```text
 前端：http://localhost:8081
-API：http://localhost:8080/v1/health
-MinIO 控制台：http://localhost:9001
+API：http://localhost:8080/health
+对象存储（LocalStack S3）：http://localhost:4566
 PostgreSQL：localhost:5432
 Redis：localhost:6379
 ```
+
+阶段 5 API、数据库表和预签名上传接口见 [`docs/API.md`](../docs/API.md)。
 
 `test` 容器会检查 API、PostgreSQL、Redis、MinIO 和前端是否可访问，并输出 `compose smoke test passed`。
 
