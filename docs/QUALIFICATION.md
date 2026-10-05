@@ -36,8 +36,6 @@
 
 ```bash
 runner/build_submission.sh submission.zip ./candidate-runner
-build/arena_match_demo --qualify-red ./candidate-runner build/arena_baseline_runner
-build/arena_match_demo --qualify-blue build/arena_baseline_runner ./candidate-runner
 ```
 
-提交脚本会自动构建基础 bot、执行两场资格赛，并在两场都通过后输出 `COMPILE_OK`。这里的 `./candidate-runner` 是上一步生成的候选 runner 可执行文件。
+提交脚本会自动构建基础 bot、通过 Match Worker 执行两场资格赛，并在两场都通过后输出 `COMPILE_OK`。这里的 `./candidate-runner` 是 Compile Worker 生成的候选 runner 可执行文件。若需要单独运行资格赛，应使用 `runner/run_match_worker.sh --qualify-red ...` 或 `--qualify-blue ...`，不要直接在宿主机执行 `arena_match_demo`。

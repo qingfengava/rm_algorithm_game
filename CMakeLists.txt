@@ -25,6 +25,7 @@ target_compile_features(arena_engine PUBLIC cxx_std_23)
 if(ARENA_BUILD_RUNNER)
     add_library(arena_runner_protocol STATIC
         runner/src/protocol.cpp
+        runner/src/seccomp.cpp
     )
     target_include_directories(arena_runner_protocol
         PUBLIC

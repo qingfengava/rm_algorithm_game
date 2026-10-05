@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,8 @@ namespace {
 
 class RunnerProcess {
   public:
+    static constexpr std::size_t kMaxResponseBytes = 64U * 1024U;
+
     explicit RunnerProcess(const char *path) {
         int input_pipe[2]{};
         int output_pipe[2]{};
@@ -88,6 +91,9 @@ class RunnerProcess {
                 return line;
             }
             line.push_back(character);
+            if (line.size() > kMaxResponseBytes) {
+                throw std::runtime_error("runner response exceeds 64 KiB");
+            }
         }
     }
 
@@ -202,8 +208,9 @@ int run_demo(const char *red_path, const char *blue_path,
 } // namespace
 
 int main(int argc, char **argv) {
-    if (argc != 2 && argc != 4) {
+    if (argc != 2 && argc != 3 && argc != 4) {
         std::cerr << "usage: arena_match_demo /path/to/arena_runner\n"
+                     "       arena_match_demo red-runner blue-runner\n"
                      "       arena_match_demo --qualify-red candidate baseline\n"
                      "       arena_match_demo --qualify-blue baseline candidate\n";
         return 64;
@@ -211,6 +218,9 @@ int main(int argc, char **argv) {
     try {
         if (argc == 2) {
             return run_demo(argv[1], argv[1]);
+        }
+        if (argc == 3) {
+            return run_demo(argv[1], argv[2]);
         }
         if (std::string(argv[1]) == "--qualify-red") {
             return run_demo(argv[2], argv[3], arena::engine::Winner::Red);

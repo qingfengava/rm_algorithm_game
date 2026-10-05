@@ -1,4 +1,5 @@
 #include "arena/runner_protocol.hpp"
+#include "arena/seccomp.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -218,6 +219,10 @@ int self_test(const Options &options) {
     }
     install_timeout_handler();
     arm_timer(options.match_time_ms);
+    if (!arena::runner::install_algorithm_seccomp()) {
+        emit_line(arena::runner::encode_error("SANDBOX_INSTALL_FAILED"));
+        return 70;
+    }
     std::unique_ptr<arena::Player> player(create_player());
     if (!player) {
         return 71;
@@ -262,6 +267,10 @@ int run_protocol(const Options &options) {
     }
     install_timeout_handler();
     arm_timer(options.match_time_ms);
+    if (!arena::runner::install_algorithm_seccomp()) {
+        emit_line(arena::runner::encode_error("SANDBOX_INSTALL_FAILED"));
+        return 70;
+    }
     const auto match_deadline = std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(options.match_time_ms);
 

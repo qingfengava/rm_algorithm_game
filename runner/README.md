@@ -2,7 +2,7 @@
 
 Runner 负责加载选手的 C++23 `Player` 实现，并在受限进程中执行 `on_match_start()` 和 `act()`。
 
-正式提交由 `runner/build_submission.sh` 构建：输入只允许包含 `bot.cpp` 的 `submission.zip`，输出一个官方 runner 可执行文件。选手不提供 `main()`，由 runner 提供进程入口。
+正式提交由 `runner/build_submission.sh` 构建：输入只允许包含 `bot.cpp` 的 `submission.zip`，输出一个官方 runner 可执行文件。选手不提供 `main()`，由 runner 提供进程入口。该脚本通过 `run_compile_worker.sh` 调用隔离的 Compile Worker，并通过 `run_match_worker.sh` 在隔离容器中完成红蓝双方资格赛。
 
 构建完成后会自动运行固定资格赛。候选算法需要在同一张资格地图上交换红蓝方各击败一次内置基础 bot，才能进入正式比赛队列；资格赛结果不计入排行榜。
 

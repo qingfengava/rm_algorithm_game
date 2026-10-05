@@ -1,5 +1,9 @@
 # Scheduler
 
-Scheduler 负责把通过编译检查的提交转换成比赛任务，并将任务发送到 Redis 队列。
+Scheduler 只负责任务编排，不执行选手代码：
 
-阶段 1 仅建立服务边界。调度逻辑在比赛服务阶段实现。
+```text
+提交 -> Compile Worker -> 已编译 runner -> Match Worker -> 结果/回放
+```
+
+Compile Worker 和 Match Worker 使用独立 rootless 容器。Scheduler/API 容器不挂载选手提交目录，不应具备运行选手二进制的权限。

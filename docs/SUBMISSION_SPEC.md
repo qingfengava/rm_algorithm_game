@@ -30,7 +30,8 @@ extern "C" arena::Player* create_player();
 ```bash
 g++ -std=c++23 -O2 -pipe -I/opt/arena/sdk/include \
     -I/opt/arena/runner/include \
-    /opt/arena/runner/src/main.cpp /opt/arena/runner/src/protocol.cpp bot.cpp \
+    /opt/arena/runner/src/main.cpp /opt/arena/runner/src/protocol.cpp \
+    /opt/arena/runner/src/seccomp.cpp bot.cpp \
     -o bot_runner
 ```
 
