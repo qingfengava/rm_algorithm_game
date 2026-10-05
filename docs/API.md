@@ -2,6 +2,8 @@
 
 API 使用 PostgreSQL 保存业务状态，Redis 只用于提交完成后的唤醒通知，源码和编译产物保存在 S3 兼容对象存储。默认本地 Compose 使用 LocalStack S3；API 不接收源码二进制流。
 
+提交完成后由 Compile Worker 自动编译 C++23 并执行基础 bot 的红蓝双向资格赛。只有资格赛两场都获胜的提交才会进入 `QUEUED`，Scheduler 随后创建与所有当前算法的双向比赛。
+
 本地默认使用 LocalStack 社区版的临时 S3 状态，PostgreSQL 中的提交、比赛和回放数据仍然持久化。API 重启不会清除仍在运行的对象存储容器；需要对象状态跨容器重建保留时，生产环境应使用 S3、OSS、COS 等持久化对象存储。
 
 ## 认证

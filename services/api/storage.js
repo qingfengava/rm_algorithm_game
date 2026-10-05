@@ -5,8 +5,10 @@ const {
   HeadObjectCommand,
   CopyObjectCommand,
   GetObjectCommand,
+  PutObjectCommand,
   PutBucketCorsCommand,
 } = require('@aws-sdk/client-s3');
+const fs = require('node:fs/promises');
 const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -134,12 +136,39 @@ function createStorage(env = process.env) {
     );
   }
 
+  async function downloadObjectToFile(key, destination, maxBytes = 256 * 1024 * 1024) {
+    const response = await internal.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const body = response.Body;
+    if (!body) throw new Error('object_body_missing');
+    const bytes = await body.transformToByteArray();
+    if (bytes.byteLength > maxBytes) throw new Error('object_too_large');
+    await fs.writeFile(destination, Buffer.from(bytes));
+    return bytes.byteLength;
+  }
+
+  async function uploadFile(key, source, contentType = 'application/octet-stream') {
+    const body = await fs.readFile(source);
+    if (body.byteLength > 256 * 1024 * 1024) throw new Error('object_too_large');
+    await internal.send(new PutObjectCommand({
+      Bucket: bucket, Key: key, Body: body, ContentType: contentType,
+    }));
+    return body.byteLength;
+  }
+
   async function health() {
     await internal.send(new HeadBucketCommand({ Bucket: bucket }));
     return true;
   }
 
-  return { ensureBucket, createUploadForm, confirmSource, sourceDownloadUrl, health };
+  return {
+    ensureBucket,
+    createUploadForm,
+    confirmSource,
+    sourceDownloadUrl,
+    downloadObjectToFile,
+    uploadFile,
+    health,
+  };
 }
 
 module.exports = { createStorage, MAX_SOURCE_BYTES };

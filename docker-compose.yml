@@ -81,6 +81,103 @@ services:
       timeout: 3s
       retries: 10
 
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/scheduler/Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-arena}
+      POSTGRES_USER: ${POSTGRES_USER:-arena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SCHEDULER_INTERVAL_MS: ${SCHEDULER_INTERVAL_MS:-5000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  compile-worker:
+    build:
+      context: .
+      dockerfile: services/compile-worker/Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-arena}
+      POSTGRES_USER: ${POSTGRES_USER:-arena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OBJECT_STORAGE_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-arena-submissions}
+      OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-test}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      OBJECT_STORAGE_AUTO_CREATE: "true"
+      COMPILE_TIMEOUT_MS: ${COMPILE_TIMEOUT_MS:-45000}
+      COMPILE_INTERVAL_MS: ${COMPILE_INTERVAL_MS:-5000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: 2
+    restart: unless-stopped
+
+  match-worker:
+    build:
+      context: .
+      dockerfile: services/match-worker/Dockerfile
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-arena}
+      POSTGRES_USER: ${POSTGRES_USER:-arena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OBJECT_STORAGE_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-arena-submissions}
+      OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-test}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      OBJECT_STORAGE_AUTO_CREATE: "true"
+      MATCH_TIMEOUT_MS: ${MATCH_TIMEOUT_MS:-15000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 768m
+    cpus: 2
+    restart: unless-stopped
+
   web:
     build:
       context: ./web

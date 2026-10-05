@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS submissions (
         'UPLOADED', 'COMPILING', 'COMPILE_FAILED',
         'QUEUED', 'RUNNING', 'FINISHED', 'RUNTIME_FAILED'
     )),
+    is_current boolean NOT NULL DEFAULT false,
     compile_log text,
     failure_reason text,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -25,6 +26,10 @@ CREATE INDEX IF NOT EXISTS submissions_user_created_idx
     ON submissions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS submissions_status_created_idx
     ON submissions(status, created_at);
+
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_current boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS submissions_current_idx
+    ON submissions(is_current, status, created_at);
 
 CREATE TABLE IF NOT EXISTS submission_artifacts (
     id uuid PRIMARY KEY,
@@ -58,6 +63,8 @@ CREATE TABLE IF NOT EXISTS matches (
 CREATE INDEX IF NOT EXISTS matches_created_idx ON matches(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS matches_red_idx ON matches(red_submission_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS matches_blue_idx ON matches(blue_submission_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS matches_pair_seed_idx
+    ON matches(red_submission_id, blue_submission_id, map_seed);
 
 CREATE TABLE IF NOT EXISTS match_events (
     match_id uuid NOT NULL REFERENCES matches(id) ON DELETE CASCADE,

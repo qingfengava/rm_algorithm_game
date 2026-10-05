@@ -19,7 +19,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-启动 PostgreSQL、Redis、MinIO、API、前端和 Compose smoke test：
+启动 PostgreSQL、Redis、S3 兼容对象存储、Compile Worker、Scheduler、Match Worker、API、前端和 Compose smoke test：
 
 ```bash
 docker compose up --build
@@ -53,6 +53,9 @@ docs/         规则、API、提交和回放规范
 ```
 
 API 基础服务、PostgreSQL/Redis/MinIO 数据流和上传验收见 [`docs/API.md`](docs/API.md)。
+Scheduler 和 Match Worker 的比赛队列、双向配对及排行榜重算见 [`services/scheduler/README.md`](services/scheduler/README.md)
+和 [`services/match-worker/README.md`](services/match-worker/README.md)。
+Compile Worker 会消费上传完成通知，编译并运行双向资格赛；通过后提交才进入正式对战队列。
 
 ## 开发约定
 

@@ -7,10 +7,13 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -58,6 +61,15 @@ class RunnerProcess {
         close(input_fd_);
         close(output_fd_);
         int status = 0;
+        const pid_t exited = waitpid(pid_, &status, WNOHANG);
+        // If the referee stops reading because the other runner failed, do
+        // not leave an algorithm process behind while waiting for it.
+        if (exited == 0) {
+            kill(pid_, SIGKILL);
+        }
+        if (exited == pid_) {
+            return;
+        }
         waitpid(pid_, &status, 0);
     }
 
@@ -154,8 +166,163 @@ arena::engine::Map qualification_map() {
     return *map;
 }
 
+std::string json_escape(std::string_view value) {
+    std::ostringstream output;
+    output << '"';
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '"': output << "\\\""; break;
+        case '\\': output << "\\\\"; break;
+        case '\n': output << "\\n"; break;
+        case '\r': output << "\\r"; break;
+        case '\t': output << "\\t"; break;
+        default:
+            if (character < 0x20U) {
+                output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                       << static_cast<unsigned int>(character) << std::dec;
+            } else {
+                output << static_cast<char>(character);
+            }
+        }
+    }
+    output << '"';
+    return output.str();
+}
+
+const char *side_name(arena::Side side) {
+    return side == arena::Side::Red ? "RED" : "BLUE";
+}
+
+const char *direction_name(arena::Direction direction) {
+    switch (direction) {
+    case arena::Direction::North: return "NORTH";
+    case arena::Direction::East: return "EAST";
+    case arena::Direction::South: return "SOUTH";
+    case arena::Direction::West: return "WEST";
+    }
+    return "NORTH";
+}
+
+const char *action_type_name(arena::ActionType type) {
+    switch (type) {
+    case arena::ActionType::Move: return "MOVE";
+    case arena::ActionType::Turn: return "TURN";
+    case arena::ActionType::Elevate: return "ELEVATE";
+    case arena::ActionType::Fire: return "FIRE";
+    case arena::ActionType::Scout: return "SCOUT";
+    }
+    return "SCOUT";
+}
+
+std::string cell_json(const arena::engine::Cell &cell) {
+    std::ostringstream output;
+    output << "{\"x\":" << static_cast<int>(cell.x) << ",\"y\":"
+           << static_cast<int>(cell.y) << ",\"z\":" << static_cast<int>(cell.plane)
+           << '}';
+    return output.str();
+}
+
+std::string drone_json(const arena::engine::DroneState &drone) {
+    std::ostringstream output;
+    output << "{\"x\":" << static_cast<int>(drone.x) << ",\"y\":"
+           << static_cast<int>(drone.y) << ",\"z\":" << static_cast<int>(drone.plane)
+           << ",\"facing\":" << json_escape(direction_name(drone.facing))
+           << ",\"alive\":" << (drone.alive ? "true" : "false") << '}';
+    return output.str();
+}
+
+std::string state_json(const arena::engine::GameState &state) {
+    std::ostringstream output;
+    output << "{\"round\":" << static_cast<int>(state.round)
+           << ",\"action_index\":" << static_cast<int>(state.action_index)
+           << ",\"active_side\":" << json_escape(side_name(state.active_side))
+           << ",\"red\":" << drone_json(state.red)
+           << ",\"blue\":" << drone_json(state.blue)
+           << ",\"finished\":" << (state.finished ? "true" : "false")
+           << ",\"winner\":" << json_escape(arena::engine::to_string(state.winner))
+           << ",\"end_reason\":" << json_escape(arena::engine::to_string(state.end_reason))
+           << '}';
+    return output.str();
+}
+
+std::string action_json(const arena::Action &action) {
+    std::ostringstream output;
+    output << "{\"type\":" << json_escape(action_type_name(action.type))
+           << ",\"direction\":" << json_escape(direction_name(action.direction)) << '}';
+    return output.str();
+}
+
+std::string scan_json(const std::optional<arena::ScanResult> &scan) {
+    if (!scan.has_value()) return "null";
+    std::ostringstream output;
+    output << "{\"plane\":" << static_cast<int>(scan->plane) << ",\"cells\":[";
+    for (std::size_t index = 0; index < scan->cells.size(); ++index) {
+        if (index != 0) output << ',';
+        const auto &cell = scan->cells[index];
+        output << "{\"dx\":" << static_cast<int>(cell.dx)
+               << ",\"dy\":" << static_cast<int>(cell.dy)
+               << ",\"x\":" << static_cast<int>(cell.x)
+               << ",\"y\":" << static_cast<int>(cell.y)
+               << ",\"in_bounds\":" << (cell.in_bounds ? "true" : "false")
+               << ",\"obstacle\":" << (cell.obstacle ? "true" : "false")
+               << ",\"enemy_present\":" << (cell.enemy_present ? "true" : "false") << '}';
+    }
+    output << "]}";
+    return output.str();
+}
+
+std::string replay_event_json(const arena::engine::ReplayEvent &event) {
+    std::ostringstream output;
+    output << "{\"seq\":" << event.sequence
+           << ",\"type\":" << json_escape(event.type == arena::engine::EventType::MatchStarted
+                                                    ? "MATCH_STARTED"
+                                                    : event.type == arena::engine::EventType::ActionResolved
+                                                          ? "ACTION_RESOLVED"
+                                                          : "MATCH_ENDED")
+           << ",\"round\":" << static_cast<int>(event.round)
+           << ",\"action_index\":" << static_cast<int>(event.action_index)
+           << ",\"side\":" << json_escape(side_name(event.side))
+           << ",\"action\":" << action_json(event.action)
+           << ",\"effect\":" << json_escape(arena::engine::to_string(event.effect))
+           << ",\"projectile_path\":[";
+    for (std::size_t index = 0; index < event.projectile_path.size(); ++index) {
+        if (index != 0) output << ',';
+        output << cell_json(event.projectile_path[index]);
+    }
+    output << "]"
+           << ",\"scan\":" << scan_json(event.scan)
+           << ",\"state_after\":" << state_json(event.state_after)
+           << ",\"state_hash\":" << json_escape(event.state_hash)
+           << ",\"winner\":" << json_escape(arena::engine::to_string(event.winner))
+           << ",\"end_reason\":" << json_escape(arena::engine::to_string(event.end_reason))
+           << '}';
+    return output.str();
+}
+
+std::string replay_json(const arena::engine::ReplayLog &log,
+                        const arena::engine::GameState &final_state) {
+    std::ostringstream output;
+    output << "{\"ok\":true,\"map_seed\":" << json_escape(std::to_string(log.map_seed))
+           << ",\"map\":{\"width\":4,\"height\":4,\"planes\":2,\"obstacles\":[";
+    for (std::size_t index = 0; index < log.map.obstacles().size(); ++index) {
+        if (index != 0) output << ',';
+        output << cell_json(log.map.obstacles()[index]);
+    }
+    output << "]},\"initial_state\":" << state_json(log.events.front().state_after)
+           << ",\"events\":[";
+    for (std::size_t index = 0; index < log.events.size(); ++index) {
+        if (index != 0) output << ',';
+        output << replay_event_json(log.events[index]);
+    }
+    output << "],\"winner\":" << json_escape(arena::engine::to_string(final_state.winner))
+           << ",\"result\":" << json_escape(arena::engine::to_string(final_state.end_reason))
+           << '}';
+    return output.str();
+}
+
 int run_demo(const char *red_path, const char *blue_path,
-             std::optional<arena::engine::Winner> required_winner = std::nullopt) {
+             std::optional<arena::engine::Winner> required_winner = std::nullopt,
+             std::uint64_t map_seed = 123456789, bool emit_json = false) {
     validate_runner_path(red_path);
     validate_runner_path(blue_path);
     RunnerProcess red(red_path);
@@ -171,7 +338,7 @@ int run_demo(const char *red_path, const char *blue_path,
 
     arena::engine::Match match = required_winner.has_value()
                                      ? arena::engine::Match(qualification_map())
-                                     : arena::engine::Match(123456789);
+                                     : arena::engine::Match(map_seed);
     send_start(red, arena::Side::Red, match.state().red);
     send_start(blue, arena::Side::Blue, match.state().blue);
 
@@ -202,12 +369,39 @@ int run_demo(const char *red_path, const char *blue_path,
     if (required_winner.has_value() && match.state().winner != *required_winner) {
         return 2;
     }
+    if (emit_json) {
+        std::cout << replay_json(match.replay_log(), match.state()) << '\n';
+    }
     return 0;
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--json") {
+        std::uint64_t seed = 123456789;
+        int index = 2;
+        if (index + 1 < argc && std::string(argv[index]) == "--seed") {
+            try {
+                seed = std::stoull(argv[index + 1]);
+            } catch (...) {
+                std::cerr << "invalid seed\n";
+                return 64;
+            }
+            index += 2;
+        }
+        if (argc - index != 2) {
+            std::cerr << "usage: arena_match_demo --json [--seed N] red-runner blue-runner\n";
+            return 64;
+        }
+        try {
+            return run_demo(argv[index], argv[index + 1], std::nullopt, seed, true);
+        } catch (const std::exception &error) {
+            std::cout << "{\"ok\":false,\"failure_reason\":\"RUNNER_ERROR\",\"error\":"
+                      << json_escape(error.what()) << "}\n";
+            return 1;
+        }
+    }
     if (argc != 2 && argc != 3 && argc != 4) {
         std::cerr << "usage: arena_match_demo /path/to/arena_runner\n"
                      "       arena_match_demo red-runner blue-runner\n"
