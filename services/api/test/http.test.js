@@ -7,10 +7,21 @@ const { createServer } = require('../server');
 function fixture() {
   const submissions = new Map();
   const user = { id: randomUUID(), handle: 'test_player' };
+  const admin = { id: randomUUID(), handle: 'root', role: 'ADMIN', active: true };
+  const users = new Map([[user.id, { ...user, role: 'PLAYER', active: true }], [admin.id, admin]]);
   let uploaded = false;
   let published = 0;
   const repo = {
-    async findUserByToken(_pool, token) { return token === 'secret' ? user : null; },
+    async findUserByCredentials(_pool, handle, password) {
+      return handle === 'test_player' && password === 'secret'
+        ? { ...user, role: 'PLAYER' } : null;
+    },
+    async issueAccessToken() { return 'issued-token'; },
+    async findUserByToken(_pool, token) {
+      if (token === 'secret') return { ...user, role: 'PLAYER', active: true };
+      if (token === 'admin-secret') return admin;
+      return null;
+    },
     async createSubmission(_pool, { id, userId, name, stagingKey }) {
       const row = {
         id, user_id: userId, name, status: 'UPLOADED',
@@ -25,6 +36,33 @@ function fixture() {
       const row = submissions.get(id);
       return row?.user_id === userId ? row : null;
     },
+    async listSubmissions(_pool, userId) {
+      return [...submissions.values()].filter((row) => row.user_id === userId);
+    },
+    async listUsers() { return [...users.values()]; },
+    async createManagedUser(_pool, values) {
+      const created = { id: randomUUID(), handle: values.handle, role: values.role, active: true, created_at: '2026-01-01T00:00:00Z' };
+      users.set(created.id, created);
+      return created;
+    },
+    async updateManagedUser(_pool, id, values) {
+      const target = users.get(id);
+      if (!target) return null;
+      Object.assign(target, values);
+      return target;
+    },
+    async deleteSubmission(_pool, id) {
+      const row = submissions.get(id);
+      if (!row) return null;
+      row.deleted_at = '2026-01-01T00:00:02Z';
+      row.is_current = false;
+      return { id };
+    },
+    async listAdminSubmissions() { return [...submissions.values()].map((row) => ({ ...row, user_handle: 'test_player', is_current: false })); },
+    async setLeaderboardOverride(_pool, values) { return values; },
+    async clearLeaderboardOverride() {},
+    async clearAllLeaderboardOverrides() {},
+    async refreshLeaderboard() { return { entries: [], snapshotId: randomUUID() }; },
     async confirmSubmission(_pool, { id, confirmSource }) {
       const row = submissions.get(id);
       if (!row) return null;
@@ -131,6 +169,10 @@ test('submission upload, persisted status, and read APIs', async () => {
   assert.equal(response.body.submission.compile_log, 'compile ok');
   assert.equal(response.body.submission.source.download_url, 'http://storage/download');
 
+  response = await app.request('GET', '/submissions?limit=10', { token: 'secret' });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.submissions.length, 1);
+
   response = await app.request('GET', '/leaderboard');
   assert.deepEqual(response.body.entries, []);
   response = await app.request('GET', '/matches');
@@ -140,6 +182,20 @@ test('submission upload, persisted status, and read APIs', async () => {
   response = await app.request('GET', `/matches/${matchId}/replay`);
   assert.equal(response.status, 200);
   assert.deepEqual(response.body.events, []);
+});
+
+test('account password login issues a bearer token', async () => {
+  const app = serve(fixture());
+  let response = await app.request('POST', '/login', {
+    body: { handle: 'test_player', password: 'secret' },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.token, 'issued-token');
+  assert.equal(response.body.user.role, 'PLAYER');
+  response = await app.request('POST', '/login', {
+    body: { handle: 'test_player', password: 'wrong' },
+  });
+  assert.equal(response.status, 401);
 });
 
 test('API rejects unauthenticated and invalid requests', async () => {
@@ -153,5 +209,40 @@ test('API rejects unauthenticated and invalid requests', async () => {
   response = await app.request('GET', `/matches/${randomUUID()}/replay`);
   assert.equal(response.status, 404);
   response = await app.request('GET', '/health');
+  assert.equal(response.status, 200);
+});
+
+test('administrator APIs enforce role and manage accounts, algorithms, and board', async () => {
+  const dependencies = fixture();
+  const app = serve(dependencies);
+  let response = await app.request('GET', '/admin/users', { token: 'secret' });
+  assert.equal(response.status, 403);
+  response = await app.request('GET', '/admin/users');
+  assert.equal(response.status, 401);
+
+  response = await app.request('POST', '/admin/users', {
+    token: 'admin-secret', body: { handle: 'new_player', password: 'password', role: 'PLAYER' },
+  });
+  assert.equal(response.status, 201);
+  const userId = response.body.user.id;
+  response = await app.request('PATCH', `/admin/users/${userId}`, {
+    token: 'admin-secret', body: { active: false },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.user.active, false);
+
+  const submissionId = randomUUID();
+  dependencies.submissions.set(submissionId, {
+    id: submissionId, user_id: userId, name: 'managed', status: 'FINISHED',
+    is_current: true, deleted_at: null,
+  });
+  response = await app.request('PUT', `/admin/leaderboard/${submissionId}`, {
+    token: 'admin-secret', body: { wins: 2, draws: 1, losses: 0, reason: 'manual review' },
+  });
+  assert.equal(response.status, 200);
+  response = await app.request('DELETE', `/admin/submissions/${submissionId}`, { token: 'admin-secret' });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.deleted, true);
+  response = await app.request('POST', '/admin/leaderboard/recalculate', { token: 'admin-secret', body: {} });
   assert.equal(response.status, 200);
 });

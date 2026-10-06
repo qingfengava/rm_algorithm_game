@@ -4,8 +4,23 @@ CREATE TABLE IF NOT EXISTS users (
     id uuid PRIMARY KEY,
     handle text NOT NULL UNIQUE CHECK (handle ~ '^[A-Za-z0-9_-]{3,32}$'),
     api_token_hash char(64) NOT NULL UNIQUE,
+    password_hash text,
+    role text NOT NULL DEFAULT 'PLAYER' CHECK (role IN ('PLAYER', 'ADMIN')),
+    active boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'PLAYER';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'users_role_check'
+  ) THEN
+    ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('PLAYER', 'ADMIN'));
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS submissions (
     id uuid PRIMARY KEY,
@@ -18,6 +33,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     is_current boolean NOT NULL DEFAULT false,
     compile_log text,
     failure_reason text,
+    deleted_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -28,8 +44,11 @@ CREATE INDEX IF NOT EXISTS submissions_status_created_idx
     ON submissions(status, created_at);
 
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_current boolean NOT NULL DEFAULT false;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 CREATE INDEX IF NOT EXISTS submissions_current_idx
     ON submissions(is_current, status, created_at);
+CREATE INDEX IF NOT EXISTS submissions_active_idx
+    ON submissions(deleted_at, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS submission_artifacts (
     id uuid PRIMARY KEY,
@@ -91,6 +110,15 @@ CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     id uuid PRIMARY KEY,
     entries jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS leaderboard_overrides (
+    submission_id uuid PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
+    wins integer NOT NULL CHECK (wins >= 0),
+    draws integer NOT NULL CHECK (draws >= 0),
+    losses integer NOT NULL CHECK (losses >= 0),
+    reason text,
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS leaderboard_snapshots_created_idx

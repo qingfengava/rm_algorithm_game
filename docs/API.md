@@ -8,13 +8,57 @@ API 使用 PostgreSQL 保存业务状态，Redis 只用于提交完成后的唤�
 
 ## 认证
 
-当前基础服务使用 `Authorization: Bearer <token>`。本地 Compose 可以通过 `ARENA_DEV_HANDLE` 和 `ARENA_DEV_TOKEN` 自动建立开发用户。生产部署应关闭开发用户配置，并在 API 容器中运行：
+登录接口使用账号密码换取 Bearer 会话令牌，业务接口继续使用 `Authorization: Bearer <token>`。Compose 默认创建管理员账号 `root`，密码为 `416`；生产环境应通过 `ARENA_ADMIN_PASSWORD` 覆盖默认密码。
 
-```bash
-node provision_user.js handle-name
+```http
+POST /login
+Content-Type: application/json
+
+{"handle":"root","password":"416"}
 ```
 
-命令只把 token 明文输出一次，数据库只保存 SHA-256 摘要。
+响应中的 `token` 作为后续请求的 Bearer 令牌。密码只以 scrypt 哈希保存，数据库不保存明文密码。
+
+管理员默认账户为 `root / 416`（可使用 `ARENA_ADMIN_HANDLE` 和 `ARENA_ADMIN_PASSWORD` 覆盖）。管理员登录后拥有 `/admin/*` 接口权限；普通用户访问这些接口会返回 `403 admin_required`。
+
+## 管理员接口
+
+```text
+GET    /admin/users?limit=50&offset=0
+POST   /admin/users
+PATCH  /admin/users/{id}
+DELETE /admin/users/{id}                 # 禁用账户
+GET    /admin/submissions?limit=50&offset=0
+DELETE /admin/submissions/{id}           # 软删除算法，保留比赛历史
+PUT    /admin/leaderboard/{submissionId} # 设置胜/平/负覆盖
+DELETE /admin/leaderboard/{submissionId} # 清除该覆盖
+POST   /admin/leaderboard/recalculate
+POST   /admin/leaderboard/recalculate?clear_overrides=true
+```
+
+创建账户示例：
+
+```json
+{"handle":"pilot_01","password":"strong-password","role":"PLAYER"}
+```
+
+修改账户可以提交 `password`、`role` 或 `active` 字段。系统不允许禁用或降级最后一个启用的管理员。删除算法只设置 `deleted_at`，不会删除比赛、事件和回放数据。
+
+排行榜覆盖示例：
+
+```json
+{"wins":12,"draws":2,"losses":4,"reason":"人工复核"}
+```
+
+覆盖只允许作用于当前有效算法，胜率和得分率仍按覆盖后的三项战绩计算。`recalculate` 默认保留覆盖；传入 `clear_overrides=true` 后会清除全部覆盖并完全依据已完成比赛重算。
+
+本地兼容的开发用户仍可通过 `ARENA_DEV_HANDLE` 和 `ARENA_DEV_TOKEN` 自动建立。生产部署应关闭开发用户配置，并在 API 容器中运行：
+
+```bash
+node provision_user.js handle-name strong-password
+```
+
+命令只把密码明文输出一次，数据库只保存密码哈希。
 
 ## 提交上传
 
@@ -39,6 +83,7 @@ Authorization: Bearer <token>
 
 ```text
 GET /health
+GET /submissions?limit=50&offset=0
 GET /submissions/{id}
 GET /leaderboard?limit=50&offset=0
 GET /matches?limit=50&offset=0

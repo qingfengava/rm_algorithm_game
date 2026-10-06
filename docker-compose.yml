@@ -65,6 +65,8 @@ services:
       OBJECT_STORAGE_AUTO_CREATE: "true"
       ARENA_DEV_HANDLE: ${ARENA_DEV_HANDLE:-local_player}
       ARENA_DEV_TOKEN: ${ARENA_DEV_TOKEN:-arena_local_dev_token_replace_me}
+      ARENA_ADMIN_HANDLE: ${ARENA_ADMIN_HANDLE:-root}
+      ARENA_ADMIN_PASSWORD: ${ARENA_ADMIN_PASSWORD:-416}
     ports:
       - "8080:8080"
     depends_on:

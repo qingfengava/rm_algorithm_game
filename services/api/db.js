@@ -45,24 +45,103 @@ function tokenHash(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+function passwordHash(password) {
+  if (typeof password !== 'string' || password.length < 1) throw new Error('invalid_password');
+  const salt = crypto.randomBytes(16);
+  const digest = crypto.scryptSync(password, salt, 32, { N: 16_384, r: 8, p: 1 });
+  return `scrypt$16384$8$1$${salt.toString('base64')}$${digest.toString('base64')}`;
+}
+
+function verifyPassword(password, encoded) {
+  if (typeof password !== 'string' || typeof encoded !== 'string') return false;
+  const parts = encoded.split('$');
+  if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
+  const salt = Buffer.from(parts[4], 'base64');
+  const expected = Buffer.from(parts[5], 'base64');
+  if (salt.length < 8 || expected.length !== 32) return false;
+  const cost = Number(parts[1]);
+  const block = Number(parts[2]);
+  const parallel = Number(parts[3]);
+  if (cost !== 16_384 || block !== 8 || parallel !== 1) return false;
+  try {
+    const actual = crypto.scryptSync(password, salt, expected.length, {
+      N: cost, r: block, p: parallel,
+    });
+    return crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
 async function provisionUser(pool, handle, token) {
   const id = crypto.randomUUID();
   const result = await pool.query(
-    `INSERT INTO users (id, handle, api_token_hash)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (handle) DO UPDATE SET api_token_hash = EXCLUDED.api_token_hash
-     RETURNING id, handle, created_at`,
-    [id, handle, tokenHash(token)],
+    `INSERT INTO users (id, handle, api_token_hash, password_hash, role)
+     VALUES ($1, $2, $3, $4, 'PLAYER')
+     ON CONFLICT (handle) DO UPDATE SET
+       api_token_hash = EXCLUDED.api_token_hash,
+       password_hash = EXCLUDED.password_hash
+     RETURNING id, handle, role, created_at`,
+    [id, handle, tokenHash(token), passwordHash(token)],
+  );
+  return result.rows[0];
+}
+
+async function provisionPasswordUser(pool, { handle, password, role = 'PLAYER' }) {
+  const id = crypto.randomUUID();
+  const token = crypto.randomBytes(32).toString('hex');
+  const result = await pool.query(
+    `INSERT INTO users (id, handle, api_token_hash, password_hash, role)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (handle) DO UPDATE SET
+       password_hash = EXCLUDED.password_hash,
+       role = EXCLUDED.role, active = true
+     RETURNING id, handle, role, created_at`,
+    [id, handle, tokenHash(token), passwordHash(password), role],
+  );
+  return result.rows[0];
+}
+
+async function ensurePasswordUser(pool, { handle, password, role = 'PLAYER' }) {
+  const id = crypto.randomUUID();
+  const token = crypto.randomBytes(32).toString('hex');
+  const result = await pool.query(
+    `INSERT INTO users (id, handle, api_token_hash, password_hash, role)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (handle) DO UPDATE SET
+       active = true, role = EXCLUDED.role,
+       password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash)
+     RETURNING id, handle, role, active, created_at`,
+    [id, handle, tokenHash(token), passwordHash(password), role],
   );
   return result.rows[0];
 }
 
 async function findUserByToken(pool, token) {
   const result = await pool.query(
-    'SELECT id, handle FROM users WHERE api_token_hash = $1',
+    'SELECT id, handle, role, active FROM users WHERE api_token_hash = $1 AND active = true',
     [tokenHash(token)],
   );
   return result.rows[0] || null;
+}
+
+async function findUserByCredentials(pool, handle, password) {
+  const result = await pool.query(
+    'SELECT id, handle, role, password_hash FROM users WHERE handle = $1 AND active = true',
+    [handle],
+  );
+  const user = result.rows[0];
+  if (!user || !verifyPassword(password, user.password_hash)) return null;
+  return { id: user.id, handle: user.handle, role: user.role };
+}
+
+async function issueAccessToken(pool, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await pool.query(
+    'UPDATE users SET api_token_hash = $2 WHERE id = $1',
+    [userId, tokenHash(token)],
+  );
+  return token;
 }
 
 async function createSubmission(pool, { id, userId, name, stagingKey }) {
@@ -85,16 +164,146 @@ async function createSubmission(pool, { id, userId, name, stagingKey }) {
 
 async function getSubmission(pool, id, userId) {
   const result = await pool.query(
-    `SELECT s.id, s.user_id, s.name, s.status, s.compile_log,
+    `SELECT s.id, s.user_id, s.name, s.status, s.is_current, s.compile_log,
             s.failure_reason, s.created_at, s.updated_at,
             a.object_key AS source_key, a.byte_size AS source_size,
             a.uploaded_at AS source_uploaded_at
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.id = $1 AND s.user_id = $2`,
+      WHERE s.id = $1 AND s.user_id = $2 AND s.deleted_at IS NULL`,
     [id, userId],
   );
   return result.rows[0] || null;
+}
+
+async function listSubmissions(pool, userId, limit, offset) {
+  const result = await pool.query(
+    `SELECT s.id, s.user_id, s.name, s.status, s.compile_log,
+            s.failure_reason, s.created_at, s.updated_at, s.is_current,
+            a.byte_size AS source_size, a.uploaded_at AS source_uploaded_at
+       FROM submissions s
+       LEFT JOIN submission_artifacts a
+         ON a.submission_id = s.id AND a.kind = 'SOURCE'
+      WHERE s.user_id = $1 AND s.deleted_at IS NULL
+      ORDER BY s.created_at DESC, s.id DESC
+      LIMIT $2 OFFSET $3`,
+    [userId, limit, offset],
+  );
+  return result.rows;
+}
+
+async function listUsers(pool, limit, offset) {
+  const result = await pool.query(
+    `SELECT id, handle, role, active, created_at
+       FROM users ORDER BY created_at ASC, id ASC LIMIT $1 OFFSET $2`,
+    [limit, offset],
+  );
+  return result.rows;
+}
+
+async function getUserById(pool, id) {
+  const result = await pool.query(
+    'SELECT id, handle, role, active, created_at FROM users WHERE id = $1',
+    [id],
+  );
+  return result.rows[0] || null;
+}
+
+async function listAdminSubmissions(pool, limit, offset) {
+  const result = await pool.query(
+    `SELECT s.id, s.user_id, u.handle AS user_handle, s.name, s.status,
+            s.is_current, s.deleted_at, s.compile_log, s.failure_reason,
+            s.created_at, s.updated_at
+       FROM submissions s
+       JOIN users u ON u.id = s.user_id
+      ORDER BY s.created_at DESC, s.id DESC
+      LIMIT $1 OFFSET $2`,
+    [limit, offset],
+  );
+  return result.rows;
+}
+
+async function createManagedUser(pool, { handle, password, role = 'PLAYER' }) {
+  if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || !['PLAYER', 'ADMIN'].includes(role)) {
+    throw new Error('invalid_user');
+  }
+  const id = crypto.randomUUID();
+  const token = crypto.randomBytes(32).toString('hex');
+  const result = await pool.query(
+    `INSERT INTO users (id, handle, api_token_hash, password_hash, role)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, handle, role, active, created_at`,
+    [id, handle, tokenHash(token), passwordHash(password), role],
+  );
+  return result.rows[0];
+}
+
+async function updateManagedUser(pool, id, { password, role, active }, { actorId = null } = {}) {
+  const fields = [];
+  const values = [id];
+  if (password !== undefined) { values.push(passwordHash(password)); fields.push(`password_hash = $${values.length}`); }
+  if (role !== undefined) { if (!['PLAYER', 'ADMIN'].includes(role)) throw new Error('invalid_role'); values.push(role); fields.push(`role = $${values.length}`); }
+  if (active !== undefined) { values.push(Boolean(active)); fields.push(`active = $${values.length}`); }
+  if (!fields.length) throw new Error('no_user_changes');
+  return transaction(pool, async (client) => {
+    const current = await client.query(
+      'SELECT id, handle, role, active FROM users WHERE id = $1 FOR UPDATE', [id],
+    );
+    const target = current.rows[0];
+    if (!target) return null;
+    const demoting = role !== undefined && role !== target.role && role !== 'ADMIN';
+    const disabling = active === false && target.active;
+    if (actorId && actorId === id && (demoting || disabling)) throw new Error('self_admin_protected');
+    if (target.role === 'ADMIN' && target.active && (demoting || disabling)) {
+      const admins = await client.query(
+        "SELECT count(*)::integer AS count FROM users WHERE role = 'ADMIN' AND active = true",
+      );
+      if (admins.rows[0].count <= 1) throw new Error('last_admin_protected');
+    }
+    const result = await client.query(
+      `UPDATE users SET ${fields.join(', ')} WHERE id = $1
+       RETURNING id, handle, role, active, created_at`, values,
+    );
+    return result.rows[0] || null;
+  });
+}
+
+async function deleteSubmission(pool, id) {
+  return transaction(pool, async (client) => {
+    const result = await client.query(
+      `UPDATE submissions SET deleted_at = now(), is_current = false, updated_at = now()
+        WHERE id = $1 AND deleted_at IS NULL RETURNING id`, [id],
+    );
+    return result.rows[0] || null;
+  });
+}
+
+async function setLeaderboardOverride(pool, { submissionId, wins, draws, losses, reason = null }) {
+  for (const value of [wins, draws, losses]) if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid_leaderboard_record');
+  return transaction(pool, async (client) => {
+    const current = await client.query(
+      'SELECT id FROM submissions WHERE id = $1 AND is_current = true AND deleted_at IS NULL',
+      [submissionId],
+    );
+    if (!current.rows[0]) throw new Error('submission_not_active');
+    const result = await client.query(
+      `INSERT INTO leaderboard_overrides (submission_id, wins, draws, losses, reason)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (submission_id) DO UPDATE SET wins = EXCLUDED.wins, draws = EXCLUDED.draws,
+         losses = EXCLUDED.losses, reason = EXCLUDED.reason, updated_at = now()
+       RETURNING submission_id, wins, draws, losses, reason, updated_at`,
+      [submissionId, wins, draws, losses, reason],
+    );
+    return result.rows[0];
+  });
+}
+
+async function clearLeaderboardOverride(pool, submissionId) {
+  await pool.query('DELETE FROM leaderboard_overrides WHERE submission_id = $1', [submissionId]);
+}
+
+async function clearAllLeaderboardOverrides(pool) {
+  await pool.query('DELETE FROM leaderboard_overrides');
 }
 
 async function listReadySubmissions(pool, limit = 50) {
@@ -102,7 +311,7 @@ async function listReadySubmissions(pool, limit = 50) {
     `SELECT s.id, s.user_id, a.object_key AS source_key
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.status = 'UPLOADED' AND a.uploaded_at IS NOT NULL
+      WHERE s.status = 'UPLOADED' AND s.deleted_at IS NULL AND a.uploaded_at IS NOT NULL
       ORDER BY s.created_at, s.id
       LIMIT $1`,
     [limit],
@@ -117,7 +326,7 @@ async function listCurrentAlgorithms(pool) {
        FROM submissions s
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
-      WHERE s.is_current = true
+      WHERE s.is_current = true AND s.deleted_at IS NULL
         AND s.status IN ('QUEUED', 'RUNNING', 'FINISHED')
         AND a.uploaded_at IS NOT NULL
       ORDER BY s.created_at ASC, s.id ASC`,
@@ -133,7 +342,7 @@ async function getCompiledArtifacts(pool, submissionIds) {
        FROM submissions s
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
-      WHERE s.id = ANY($1::uuid[]) AND a.uploaded_at IS NOT NULL`,
+      WHERE s.id = ANY($1::uuid[]) AND s.deleted_at IS NULL AND a.uploaded_at IS NOT NULL`,
     [submissionIds],
   );
   return result.rows;
@@ -180,6 +389,7 @@ async function listLeaderboard(pool, limit, offset) {
        FROM leaderboard_entries e
        JOIN submissions s ON s.id = e.submission_id
        JOIN users u ON u.id = s.user_id
+      WHERE s.deleted_at IS NULL
       ORDER BY e.rank ASC, e.submission_id ASC
       LIMIT $1 OFFSET $2`,
     [limit, offset],
@@ -275,7 +485,7 @@ async function setSubmissionStatus(pool, id, status, { compileLog = null, failur
       `UPDATE submissions s SET status = $2,
               compile_log = COALESCE($3, s.compile_log),
               failure_reason = COALESCE($4, s.failure_reason), updated_at = now()
-        WHERE s.id = $1 AND s.status = $5
+        WHERE s.id = $1 AND s.status = $5 AND s.deleted_at IS NULL
           AND EXISTS (
             SELECT 1 FROM submission_artifacts a
              WHERE a.submission_id = s.id AND a.kind = 'SOURCE' AND a.uploaded_at IS NOT NULL
@@ -535,7 +745,7 @@ async function saveLeaderboardSnapshot(pool, entries) {
 async function leaderboardReadyInTransaction(client) {
   const result = await client.query([
     'WITH current_algorithms AS (',
-    '  SELECT id FROM submissions WHERE is_current = true',
+    '  SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL',
     '), expected AS (',
     '  SELECT count(*)::bigint * greatest(count(*) - 1, 0)::bigint AS count',
     '    FROM current_algorithms',
@@ -561,7 +771,7 @@ async function leaderboardReadyInTransaction(client) {
 async function refreshLeaderboardInTransaction(client) {
     const result = await client.query(
       `WITH current_algorithms AS (
-             SELECT id FROM submissions WHERE is_current = true
+             SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL
            ), outcomes AS (
              SELECT red_submission_id AS submission_id,
                     CASE WHEN winner = 'RED' THEN 1 ELSE 0 END AS wins,
@@ -580,7 +790,7 @@ async function refreshLeaderboardInTransaction(client) {
               WHERE m.status = 'FINISHED'
                 AND m.red_submission_id IN (SELECT id FROM current_algorithms)
                 AND m.blue_submission_id IN (SELECT id FROM current_algorithms)
-           ), totals AS (
+           ), raw_totals AS (
              SELECT c.id AS submission_id,
                     COALESCE(SUM(o.wins), 0)::integer AS wins,
                     COALESCE(SUM(o.draws), 0)::integer AS draws,
@@ -588,6 +798,13 @@ async function refreshLeaderboardInTransaction(client) {
                FROM current_algorithms c
                LEFT JOIN outcomes o ON o.submission_id = c.id
               GROUP BY c.id
+           ), totals AS (
+             SELECT r.submission_id,
+                    COALESCE(o.wins, r.wins) AS wins,
+                    COALESCE(o.draws, r.draws) AS draws,
+                    COALESCE(o.losses, r.losses) AS losses
+               FROM raw_totals r
+               LEFT JOIN leaderboard_overrides o ON o.submission_id = r.submission_id
            )
        SELECT submission_id, wins, draws, losses,
               CASE WHEN wins + draws + losses = 0 THEN 0
@@ -635,10 +852,26 @@ module.exports = {
   createPool,
   bootstrap,
   tokenHash,
+  passwordHash,
+  verifyPassword,
   provisionUser,
+  provisionPasswordUser,
   findUserByToken,
+  findUserByCredentials,
+  issueAccessToken,
+  ensurePasswordUser,
   createSubmission,
   getSubmission,
+  listSubmissions,
+  listUsers,
+  getUserById,
+  listAdminSubmissions,
+  createManagedUser,
+  updateManagedUser,
+  deleteSubmission,
+  setLeaderboardOverride,
+  clearLeaderboardOverride,
+  clearAllLeaderboardOverrides,
   listReadySubmissions,
   listCurrentAlgorithms,
   getCompiledArtifacts,

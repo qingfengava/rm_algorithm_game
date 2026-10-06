@@ -10,6 +10,7 @@ node --check services/match-worker/index.js
 node --check services/compile-worker/index.js
 node --check tests/api_integration.js
 node --check tests/smoke.js
+node -e "const fs=require('fs'),vm=require('vm'); for(const match of fs.readFileSync('web/index.html','utf8').matchAll(/<script>([\\s\\S]*?)<\\/script>/g)) new vm.Script(match[1]);"
 npm --prefix services/api test
 npm --prefix services/scheduler test
 npm --prefix services/match-worker test

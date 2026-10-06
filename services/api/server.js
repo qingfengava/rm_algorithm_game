@@ -6,6 +6,9 @@ const submissionPath = new RegExp(`^/submissions/(${UUID})$`, 'i');
 const completePath = new RegExp(`^/submissions/(${UUID})/complete$`, 'i');
 const matchPath = new RegExp(`^/matches/(${UUID})$`, 'i');
 const replayPath = new RegExp(`^/matches/(${UUID})/replay$`, 'i');
+const adminUserPath = new RegExp(`^/admin/users/(${UUID})$`, 'i');
+const adminSubmissionPath = new RegExp(`^/admin/submissions/(${UUID})$`, 'i');
+const adminLeaderboardPath = new RegExp(`^/admin/leaderboard/(${UUID})$`, 'i');
 const MAX_METADATA_BYTES = 16 * 1024;
 
 class HttpError extends Error {
@@ -67,6 +70,7 @@ function serializeSubmission(row) {
     user_id: row.user_id,
     name: row.name,
     status: row.status,
+    is_current: Boolean(row.is_current),
     compile_log: row.compile_log,
     failure_reason: row.failure_reason,
     created_at: row.created_at,
@@ -79,6 +83,22 @@ function serializeSubmission(row) {
   };
 }
 
+function serializeAdminUser(row) {
+  return {
+    id: row.id, handle: row.handle, role: row.role, active: Boolean(row.active),
+    created_at: row.created_at,
+  };
+}
+
+function serializeAdminSubmission(row) {
+  return {
+    id: row.id, user_id: row.user_id, user_handle: row.user_handle,
+    name: row.name, status: row.status, is_current: Boolean(row.is_current),
+    deleted_at: row.deleted_at, compile_log: row.compile_log,
+    failure_reason: row.failure_reason, created_at: row.created_at, updated_at: row.updated_at,
+  };
+}
+
 function createServer({ pool, storage, queue, repo, logger = console }) {
   async function authenticatedUser(request) {
     const match = /^Bearer ([^\s]+)$/.exec(String(request.headers.authorization || ''));
@@ -88,9 +108,46 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     return user;
   }
 
+  async function adminUser(request) {
+    const user = await authenticatedUser(request);
+    if (user.role !== 'ADMIN') throw new HttpError(403, 'admin_required');
+    return user;
+  }
+
+  function repoError(error) {
+    const map = {
+      invalid_user: [400, 'invalid_user'], invalid_password: [400, 'invalid_password'],
+      invalid_role: [400, 'invalid_role'], no_user_changes: [400, 'no_user_changes'],
+      self_admin_protected: [409, 'self_admin_protected'],
+      last_admin_protected: [409, 'last_admin_protected'],
+      invalid_leaderboard_record: [400, 'invalid_leaderboard_record'],
+      submission_not_active: [409, 'submission_not_active'],
+    };
+    const value = map[error?.message];
+    return value ? new HttpError(value[0], value[1]) : error;
+  }
+
   async function handle(request, response) {
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname;
+
+    if (request.method === 'POST' && path === '/login') {
+      const body = await readJson(request);
+      const handle = typeof body.handle === 'string' ? body.handle.trim() : '';
+      const password = typeof body.password === 'string' ? body.password : '';
+      if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || password.length < 1) {
+        throw new HttpError(400, 'invalid_credentials');
+      }
+      const user = await repo.findUserByCredentials(pool, handle, password);
+      if (!user) throw new HttpError(401, 'invalid_credentials');
+      const token = await repo.issueAccessToken(pool, user.id);
+      sendJson(response, 200, {
+        token,
+        token_type: 'Bearer',
+        user: { id: user.id, handle: user.handle, role: user.role },
+      });
+      return;
+    }
 
     if (request.method === 'GET' && path === '/healthz') {
       sendJson(response, 200, { status: 'ok', service: 'arena-api' });
@@ -113,6 +170,107 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
         service: 'arena-api',
         dependencies,
       });
+      return;
+    }
+
+    if (path === '/admin/users' && request.method === 'GET') {
+      await adminUser(request);
+      const { limit, offset } = pagination(url.searchParams);
+      const users = await repo.listUsers(pool, limit, offset);
+      sendJson(response, 200, { users: users.map(serializeAdminUser), limit, offset });
+      return;
+    }
+
+    if (path === '/admin/users' && request.method === 'POST') {
+      await adminUser(request);
+      const body = await readJson(request);
+      const handle = typeof body.handle === 'string' ? body.handle.trim() : '';
+      const password = typeof body.password === 'string' ? body.password : '';
+      const role = body.role === undefined ? 'PLAYER' : body.role;
+      if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || password.length < 1 ||
+          !['PLAYER', 'ADMIN'].includes(role)) throw new HttpError(400, 'invalid_user');
+      try {
+        const created = await repo.createManagedUser(pool, { handle, password, role });
+        sendJson(response, 201, { user: serializeAdminUser(created) }, { location: `/admin/users/${created.id}` });
+      } catch (error) {
+        if (error.code === '23505') throw new HttpError(409, 'handle_already_exists');
+        throw repoError(error);
+      }
+      return;
+    }
+
+    const adminUserMatch = adminUserPath.exec(path);
+    if (adminUserMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
+      const actor = await adminUser(request);
+      const id = adminUserMatch[1];
+      const body = request.method === 'PATCH' ? await readJson(request) : { active: false };
+      if (body.password !== undefined && (typeof body.password !== 'string' || body.password.length < 1)) {
+        throw new HttpError(400, 'invalid_password');
+      }
+      if (body.active !== undefined && typeof body.active !== 'boolean') throw new HttpError(400, 'invalid_active');
+      try {
+        const updated = await repo.updateManagedUser(pool, id, {
+          password: body.password, role: body.role, active: body.active,
+        }, { actorId: actor.id });
+        if (!updated) throw new HttpError(404, 'user_not_found');
+        sendJson(response, 200, { user: serializeAdminUser(updated) });
+      } catch (error) {
+        throw repoError(error);
+      }
+      return;
+    }
+
+    if (path === '/admin/submissions' && request.method === 'GET') {
+      await adminUser(request);
+      const { limit, offset } = pagination(url.searchParams);
+      const submissions = await repo.listAdminSubmissions(pool, limit, offset);
+      sendJson(response, 200, { submissions: submissions.map(serializeAdminSubmission), limit, offset });
+      return;
+    }
+
+    const adminSubmissionMatch = adminSubmissionPath.exec(path);
+    if (adminSubmissionMatch && request.method === 'DELETE') {
+      await adminUser(request);
+      const deleted = await repo.deleteSubmission(pool, adminSubmissionMatch[1]);
+      if (!deleted) throw new HttpError(404, 'submission_not_found');
+      if (typeof repo.refreshLeaderboard === 'function') await repo.refreshLeaderboard(pool);
+      sendJson(response, 200, { deleted: true, submission_id: deleted.id });
+      return;
+    }
+
+    if (path === '/admin/leaderboard/recalculate' && request.method === 'POST') {
+      await adminUser(request);
+      if (url.searchParams.get('clear_overrides') === 'true' && typeof repo.clearAllLeaderboardOverrides === 'function') {
+        await repo.clearAllLeaderboardOverrides(pool);
+      }
+      const result = await repo.refreshLeaderboard(pool);
+      sendJson(response, 200, { entries: result.entries, snapshot_id: result.snapshotId });
+      return;
+    }
+
+    const adminLeaderboardMatch = adminLeaderboardPath.exec(path);
+    if (adminLeaderboardMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
+      await adminUser(request);
+      const submissionId = adminLeaderboardMatch[1];
+      if (request.method === 'DELETE') {
+        await repo.clearLeaderboardOverride(pool, submissionId);
+      } else {
+        const body = await readJson(request);
+        const values = [body.wins, body.draws, body.losses];
+        if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+          throw new HttpError(400, 'invalid_leaderboard_record');
+        }
+        if (body.reason !== undefined && body.reason !== null && typeof body.reason !== 'string') {
+          throw new HttpError(400, 'invalid_reason');
+        }
+        try {
+          await repo.setLeaderboardOverride(pool, {
+            submissionId, wins: body.wins, draws: body.draws, losses: body.losses, reason: body.reason || null,
+          });
+        } catch (error) { throw repoError(error); }
+      }
+      const result = await repo.refreshLeaderboard(pool);
+      sendJson(response, 200, { entries: result.entries, snapshot_id: result.snapshotId });
       return;
     }
 
@@ -139,6 +297,21 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
         upload,
       }, {
         location: `/submissions/${id}`,
+      });
+      return;
+    }
+
+    if (path === '/submissions' && request.method === 'GET') {
+      const user = await authenticatedUser(request);
+      const { limit, offset } = pagination(url.searchParams);
+      const rows = await repo.listSubmissions(pool, user.id, limit, offset);
+      sendJson(response, 200, {
+        submissions: rows.map((row) => ({
+          ...serializeSubmission(row),
+          is_current: Boolean(row.is_current),
+        })),
+        limit,
+        offset,
       });
       return;
     }
@@ -213,9 +386,10 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       return;
     }
 
-    const known = path === '/submissions' || path === '/leaderboard' ||
+    const known = path === '/login' || path === '/submissions' || path === '/leaderboard' ||
       path === '/matches' || submissionPath.test(path) || completePath.test(path) ||
-      matchPath.test(path) || replayPath.test(path) || path === '/healthz' || path === '/health';
+      matchPath.test(path) || replayPath.test(path) || path === '/healthz' || path === '/health' ||
+      path.startsWith('/admin/');
     if (known) throw new HttpError(405, 'method_not_allowed');
     throw new HttpError(404, 'not_found');
   }
@@ -264,6 +438,11 @@ async function start(env = process.env) {
   }
   try {
     await retry(() => db.bootstrap(pool));
+    await db.ensurePasswordUser(pool, {
+      handle: env.ARENA_ADMIN_HANDLE || 'root',
+      password: env.ARENA_ADMIN_PASSWORD || '416',
+      role: 'ADMIN',
+    });
     if (env.ARENA_DEV_HANDLE && env.ARENA_DEV_TOKEN) {
       await db.provisionUser(pool, env.ARENA_DEV_HANDLE, env.ARENA_DEV_TOKEN);
     }
