@@ -7,6 +7,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 RUN cmake -S . -B build -DARENA_BUILD_TESTS=OFF -DARENA_BUILD_RUNNER=ON \
+        -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
     && cmake --build build --target arena_match_demo --parallel
 
 FROM node:22-bookworm-slim
@@ -14,7 +15,9 @@ FROM node:22-bookworm-slim
 WORKDIR /app
 
 COPY services/match-worker/package.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund \
+RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
+    --fetch-retries=5 --fetch-retry-factor=2 --fetch-retry-mintimeout=1000 \
+    --fetch-retry-maxtimeout=120000 --maxsockets=1 \
     && npm cache clean --force
 
 COPY services/match-worker/index.js ./index.js

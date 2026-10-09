@@ -9,19 +9,35 @@ const MATCH_QUEUE = 'arena:matches:queue';
 function createMatchWorker({ pool, queue, storage, repo, command, logger = console }) {
   const matchCommand = command || process.env.ARENA_MATCH_BINARY || '/app/arena_match_demo';
 
-  async function runCommand(args, timeoutMs = 15_000) {
+  async function runCommand(args, timeoutMs = 15_000, onMessage = null) {
     return new Promise((resolve) => {
       const child = spawn(matchCommand, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       let timedOut = false;
+      let bytes = 0;
+      let processing = Promise.resolve();
+      let processingError = null;
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill('SIGKILL');
       }, timeoutMs);
       child.stdout.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 32 * 1024 * 1024) { child.kill('SIGKILL'); return; }
         stdout += chunk.toString('utf8');
-        if (stdout.length > 32 * 1024 * 1024) child.kill('SIGKILL');
+        if (onMessage) {
+          const lines = stdout.split(/\r?\n/);
+          stdout = lines.pop();
+          if (stdout.length > 1024 * 1024) { child.kill('SIGKILL'); return; }
+          child.stdout.pause();
+          processing = processing.then(async () => {
+            for (const line of lines) if (line) await onMessage(JSON.parse(line));
+          }).catch((error) => {
+            processingError = error;
+            child.kill('SIGKILL');
+          }).finally(() => child.stdout.resume());
+        }
       });
       child.stderr.on('data', (chunk) => {
         stderr += chunk.toString('utf8').slice(0, 64 * 1024);
@@ -30,8 +46,24 @@ function createMatchWorker({ pool, queue, storage, repo, command, logger = conso
         clearTimeout(timer);
         resolve({ ok: false, failureReason: 'WORKER_EXEC_ERROR', error: error.message, stderr });
       });
-      child.on('close', (code, signal) => {
+      child.on('close', async (code, signal) => {
         clearTimeout(timer);
+        await processing;
+        if (processingError) {
+          resolve({ ok: false, failureReason: 'REPLAY_WRITE_ERROR', error: processingError.message, stderr });
+          return;
+        }
+        if (onMessage) {
+          if (stdout.trim()) {
+            try { await onMessage(JSON.parse(stdout.trim())); }
+            catch (error) {
+              resolve({ ok: false, failureReason: 'INVALID_MATCH_STREAM', error: error.message, stderr });
+              return;
+            }
+          }
+          resolve({ ok: !timedOut && code === 0, failureReason: timedOut ? 'TIMEOUT' : 'RUNNER_ERROR', stderr });
+          return;
+        }
         const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
         let result = null;
         if (lines.length > 0) {
@@ -88,20 +120,57 @@ function createMatchWorker({ pool, queue, storage, repo, command, logger = conso
       await fs.chmod(redPath, 0o755);
       await fs.chmod(bluePath, 0o755);
 
+      const replay = { match_id: matchId, map_seed: String(claimed.map_seed), events: [] };
+      let finished = false;
+      const streamKey = `arena:matches:events:${matchId}`;
       const result = await runCommand([
-        '--json', '--seed', String(claimed.map_seed), redPath, bluePath,
-      ], Number(process.env.MATCH_TIMEOUT_MS || 15_000));
+        '--json-stream', '--seed', String(claimed.map_seed), redPath, bluePath,
+      ], Number(process.env.MATCH_TIMEOUT_MS || 15_000), async (message) => {
+        if (message.kind === 'start') {
+          if (replay.map || message.map_seed !== replay.map_seed || !message.map || !message.initial_state) {
+            throw new Error('invalid_match_start');
+          }
+          replay.map = message.map;
+          replay.initial_state = message.initial_state;
+          await repo.startMatchReplay(pool, matchId, replay);
+        } else if (message.kind === 'event') {
+          const event = message.event;
+          if (!replay.map || finished || !event || event.seq !== replay.events.length ||
+              !/^fnv1a64:[0-9a-f]{16}$/.test(event.state_hash)) throw new Error('invalid_match_event');
+          if (event.seq === 0 && (event.type !== 'MATCH_STARTED' ||
+              JSON.stringify(event.state_after) !== JSON.stringify(replay.initial_state))) {
+            throw new Error('invalid_initial_event');
+          }
+          await repo.appendMatchEvent(pool, matchId, event);
+          replay.events.push(event);
+          try {
+            await queue.xAdd(streamKey, '*', { event: JSON.stringify(event) });
+            await queue.expire(streamKey, 86400);
+          } catch (error) { logger.warn('Replay stream publish failed', { matchId, error }); }
+        } else if (message.kind === 'result') {
+          if (finished || !['RED', 'BLUE', 'DRAW'].includes(message.winner)) throw new Error('invalid_match_result');
+          replay.winner = message.winner;
+          replay.result = message.result;
+          finished = true;
+        } else if (message.kind === 'error') {
+          throw new Error(message.error || message.failure_reason || 'runner_error');
+        } else throw new Error('invalid_match_message');
+      });
       if (!result.ok) {
         await markFailed(matchId, result.failureReason);
         logger.error('Match failed', { matchId, reason: result.failureReason, error: result.error });
         return { status: 'failed', reason: result.failureReason };
       }
-      const replay = result.result;
-      if (!['RED', 'BLUE', 'DRAW'].includes(replay.winner)) {
+      if (!finished || replay.events.at(-1)?.type !== 'MATCH_ENDED' ||
+          replay.events.at(-1)?.winner !== replay.winner) {
         await markFailed(matchId, 'INVALID_MATCH_RESULT');
         return { status: 'failed', reason: 'INVALID_MATCH_RESULT' };
       }
-      await repo.completeMatch(pool, matchId, replay);
+      const replayPath = path.join(temporary, 'replay.json');
+      await fs.writeFile(replayPath, JSON.stringify(replay));
+      replay.replay_object_key = `matches/${matchId}/replay.json`;
+      await storage.uploadFile(replay.replay_object_key, replayPath, 'application/json');
+      await repo.completeStreamedMatch(pool, matchId, replay);
       return { status: 'finished', winner: replay.winner };
     } catch (error) {
       await markFailed(matchId, error.code || error.message || 'WORKER_ERROR');

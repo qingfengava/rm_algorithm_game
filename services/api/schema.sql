@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS matches (
     failure_reason text,
     map_data jsonb,
     initial_state jsonb,
+    replay_object_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
     finished_at timestamptz,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 
 CREATE INDEX IF NOT EXISTS matches_created_idx ON matches(created_at DESC, id DESC);
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS replay_object_key text;
 CREATE INDEX IF NOT EXISTS matches_red_idx ON matches(red_submission_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS matches_blue_idx ON matches(blue_submission_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS matches_pair_seed_idx

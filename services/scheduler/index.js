@@ -41,19 +41,65 @@ function createScheduler({ pool, queue, repo, logger = console }) {
     if (running) return { skipped: true, created: 0 };
     running = true;
     try {
-      const algorithms = await repo.listCurrentAlgorithms(pool);
-      const created = await repo.ensureMatchesForAlgorithms(
-        pool,
-        algorithms,
-        mapSeedForPair,
-      );
+      let created = [];
+      // Ranked algorithms are FINISHED submissions. A QUEUED submission has
+      // passed qualification but must not affect the board until every
+      // two-sided match against the current board is terminal.
+      const promote = async (submissionId) => {
+        if (typeof repo.promoteSubmissionAndRefresh === 'function') {
+          return repo.promoteSubmissionAndRefresh(pool, submissionId);
+        }
+        const promoted = typeof repo.promoteSubmissionToLeaderboard === 'function'
+          ? await repo.promoteSubmissionToLeaderboard(pool, submissionId) : null;
+        if (promoted && typeof repo.refreshLeaderboard === 'function') {
+          await repo.refreshLeaderboard(pool);
+        }
+        return promoted;
+      };
+      if (typeof repo.listRankedAlgorithms === 'function' &&
+          typeof repo.listPendingAlgorithms === 'function') {
+        const ranked = await repo.listRankedAlgorithms(pool);
+        const pending = await repo.listPendingAlgorithms(pool);
+
+        if (ranked.length === 0) {
+          // The first qualified algorithm is the seed of the leaderboard and
+          // has no opponent to wait for. Promote one at a time so multiple
+          // submissions cannot bypass the matching stage concurrently.
+          if (pending.length > 0) await promote(pending[0].id);
+        } else {
+          for (const submission of pending) {
+            if (typeof repo.ensureMatchesForSubmission !== 'function' ||
+                typeof repo.listMatchesForSubmission !== 'function') break;
+            const pairMatches = await repo.ensureMatchesForSubmission(
+              pool, submission, ranked, mapSeedForPair,
+            );
+            created.push(...pairMatches);
+            const matches = await repo.listMatchesForSubmission(pool, submission.id);
+            const expected = ranked.length * 2;
+            const rankedIds = new Set(ranked.map((algorithm) => String(algorithm.id)));
+            const terminal = matches.filter((match) =>
+              ['FINISHED', 'RUNTIME_FAILED'].includes(match.status) &&
+              rankedIds.has(String(match.red_submission_id === submission.id
+                ? match.blue_submission_id : match.red_submission_id)));
+            if (expected > 0 && terminal.length >= expected) {
+              await promote(submission.id);
+              // The promoted candidate becomes part of the ranked set. Stop
+              // this pass so the next pending candidate also plays against it.
+              break;
+            }
+          }
+        }
+      } else {
+        // Compatibility path for older repository test doubles. Production
+        // uses the ranked/pending flow above.
+        const algorithms = await repo.listCurrentAlgorithms(pool);
+        created = await repo.ensureMatchesForAlgorithms(pool, algorithms, mapSeedForPair);
+        if (algorithms.length < 2 && typeof repo.refreshLeaderboard === 'function') {
+          await repo.refreshLeaderboard(pool);
+        }
+      }
       const queued = await repo.listQueuedMatches(pool, 1000);
       const enqueued = await enqueue(queued);
-      // A lone current algorithm has no matches but should still appear with
-      // a zeroed row on the leaderboard.
-      if (algorithms.length < 2 && typeof repo.refreshLeaderboard === 'function') {
-        await repo.refreshLeaderboard(pool);
-      }
       return { skipped: false, created: created.length, enqueued };
     } finally {
       running = false;

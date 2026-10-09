@@ -18,6 +18,18 @@ test('match command parses a structured result', {
   assert.deepEqual(result, { ok: true, result: { ok: true, winner: 'DRAW' } });
 });
 
+test('match command preserves ordered replay stream messages', async () => {
+  const worker = createMatchWorker({
+    pool: {}, queue: {}, storage: {}, repo: {}, command: '/bin/sh',
+  });
+  const messages = [];
+  const result = await worker.runCommand([
+    '-c', 'printf "%s\\n%s\\n" "{\\"kind\\":\\"event\\",\\"event\\":{\\"seq\\":1}}" "{\\"kind\\":\\"result\\",\\"winner\\":\\"DRAW\\"}"',
+  ], 1000, async (message) => messages.push(message));
+  assert.equal(result.ok, true);
+  assert.deepEqual(messages.map((message) => message.kind), ['event', 'result']);
+});
+
 test('invalid queue messages do not reach the repository', async () => {
   const worker = createMatchWorker({
     pool: {},

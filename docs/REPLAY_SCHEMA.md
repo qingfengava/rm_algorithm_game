@@ -261,4 +261,23 @@ SANDBOX_VIOLATION
 
 实时回放通过 WebSocket 发送单个事件对象。客户端断线后，可以携带最后收到的 `seq`，由服务端补发后续事件。
 
+## 8. 实时服务协议
+
+连接地址为：
+
+```text
+ws(s)://<host>/ws/matches/{match_id}?after_seq=10
+ws(s)://<host>/v1/matches/{match_id}?after_seq=10
+```
+
+Gateway 先发送 `snapshot`，随后发送所有 `seq > after_seq` 的事件：
+
+```json
+{"kind":"snapshot","match_id":"...","status":"RUNNING","map":{},"initial_state":{}}
+{"kind":"event","event":{"seq":11,"type":"ACTION_RESOLVED"}}
+{"kind":"complete","status":"FINISHED","winner":"RED"}
+```
+
+PostgreSQL 的 `match_events` 是断线补发和历史回放的权威来源；Redis Stream `arena:matches:events:{match_id}` 只负责低延迟唤醒实时连接。每个连接使用独立 Redis 消费连接，不共享消费游标，因此多个观众不会互相消费事件。比赛结束后，完整回放以 `matches/{match_id}/replay.json` 上传对象存储，数据库记录对象键并继续提供可检索的事件副本。
+
 历史回放可以直接返回完整 JSON，也可以按 `seq` 分页读取。网站观战数据与选手 API 完全隔离，选手进程不能访问回放服务。

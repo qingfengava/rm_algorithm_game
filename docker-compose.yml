@@ -124,6 +124,7 @@ services:
       OBJECT_STORAGE_AUTO_CREATE: "true"
       COMPILE_TIMEOUT_MS: ${COMPILE_TIMEOUT_MS:-45000}
       COMPILE_INTERVAL_MS: ${COMPILE_INTERVAL_MS:-5000}
+      TMPDIR: /run/arena-compile
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,6 +135,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
+      - /run/arena-compile:rw,exec,nosuid,nodev,size=256m
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
@@ -180,6 +182,31 @@ services:
     cpus: 2
     restart: unless-stopped
 
+  replay-gateway:
+    build:
+      context: .
+      dockerfile: services/replay-gateway/Dockerfile
+    environment:
+      PORT: 8082
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-arena}
+      POSTGRES_USER: ${POSTGRES_USER:-arena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8082/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   web:
     build:
       context: ./web
@@ -188,6 +215,8 @@ services:
       - "8081:80"
     depends_on:
       api:
+        condition: service_healthy
+      replay-gateway:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://localhost/healthz || exit 1"]

@@ -19,7 +19,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-启动 PostgreSQL、Redis、S3 兼容对象存储、Compile Worker、Scheduler、Match Worker、API、前端和 Compose smoke test：
+启动 PostgreSQL、Redis、S3 兼容对象存储、Compile Worker、Scheduler、Match Worker、Replay Gateway、API、前端和 Compose smoke test：
 
 ```bash
 docker compose up --build
@@ -31,6 +31,7 @@ docker compose up --build
 前端：http://localhost:8081
 API：http://localhost:8080/health
 对象存储（LocalStack S3）：http://localhost:4566
+实时回放（经前端代理）：ws://localhost:8081/ws/matches/{match_id}
 ```
 
 前端当前提供登录、算法上传、编译/资格赛状态、排行榜、我的版本、比赛列表、比赛详情和逐事件回放页面。

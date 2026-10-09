@@ -7,13 +7,15 @@ UPLOADED
   -> Compile Worker
   -> COMPILING
   -> COMPILE_FAILED
-  -> QUEUED
-  -> Scheduler 创建双向 BO1
+  -> QUEUED（资格赛通过，等待正式匹配）
+  -> Scheduler 创建与已上榜算法的双向 BO1
   -> Match Worker
-  -> FINISHED / RUNTIME_FAILED
+  -> FINISHED（全部正式比赛终态后进入排行榜）
 ```
 
-Scheduler 只读取 `is_current = true` 且存在 `COMPILED` artifact 的提交。每一对算法创建两条比赛记录：
+Scheduler 将 `FINISHED` 且 `is_current = true` 的提交视为已上榜算法，将 `QUEUED` 提交视为待匹配算法；待匹配版本
+不会提前替换提交者的当前榜上版本。排行榜为空时，第一个待匹配算法
+直接变为 `FINISHED` 并以零战绩入榜；否则待匹配算法只与每个已上榜算法创建两条比赛记录：
 
 ```text
 A 红方, B 蓝方
@@ -27,6 +29,9 @@ B 红方, A 蓝方
 Match Worker 领取任务时使用 `QUEUED -> RUNNING` 原子更新。它下载两个编译 runner，调用结构化 JSON 裁判，
 并在一个 PostgreSQL 事务中写入地图、初始状态、事件、胜者和 `FINISHED`。超时、崩溃、缺少 artifact 或非法
 裁判输出会写入 `RUNTIME_FAILED` 和 `failure_reason`。
+
+`RUNTIME_FAILED` 是比赛记录的终态；提交本身仍保持 `QUEUED`，直到它与所有已上榜算法的两场比赛均进入终态，
+然后才以 `FINISHED` 提交进入排行榜。
 
 排行榜只统计当前算法之间的 `FINISHED` 比赛：
 

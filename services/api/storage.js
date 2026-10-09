@@ -136,6 +136,10 @@ function createStorage(env = process.env) {
     );
   }
 
+  async function objectDownloadUrl(key, expiresIn = DOWNLOAD_EXPIRY_SECONDS) {
+    return getSignedUrl(publicClient, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
+  }
+
   async function downloadObjectToFile(key, destination, maxBytes = 256 * 1024 * 1024) {
     const response = await internal.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = response.Body;
@@ -165,6 +169,7 @@ function createStorage(env = process.env) {
     createUploadForm,
     confirmSource,
     sourceDownloadUrl,
+    objectDownloadUrl,
     downloadObjectToFile,
     uploadFile,
     health,

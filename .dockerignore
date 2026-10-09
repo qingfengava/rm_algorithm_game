@@ -1,0 +1,15 @@
+# Never copy host build products or CMake caches into engine build stages.
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Local dependencies and repository metadata are not image inputs.
+node_modules/
+.git/
+.gitignore
+.codex/
+.agents/
+*.log

@@ -320,9 +320,15 @@ std::string replay_json(const arena::engine::ReplayLog &log,
     return output.str();
 }
 
+void stream_event(const arena::engine::ReplayEvent &event) {
+    std::cout << "{\"kind\":\"event\",\"event\":" << replay_event_json(event)
+              << "}" << std::endl;
+}
+
 int run_demo(const char *red_path, const char *blue_path,
              std::optional<arena::engine::Winner> required_winner = std::nullopt,
-             std::uint64_t map_seed = 123456789, bool emit_json = false) {
+             std::uint64_t map_seed = 123456789, bool emit_json = false,
+             bool stream_json = false) {
     validate_runner_path(red_path);
     validate_runner_path(blue_path);
     RunnerProcess red(red_path);
@@ -339,6 +345,18 @@ int run_demo(const char *red_path, const char *blue_path,
     arena::engine::Match match = required_winner.has_value()
                                      ? arena::engine::Match(qualification_map())
                                      : arena::engine::Match(map_seed);
+    if (stream_json) {
+        const auto &obstacles = match.map().obstacles();
+        std::cout << "{\"kind\":\"start\",\"map_seed\":"
+                  << json_escape(std::to_string(match.map_seed()))
+                  << ",\"map\":{\"width\":4,\"height\":4,\"planes\":2,\"obstacles\":[";
+        for (std::size_t index = 0; index < obstacles.size(); ++index) {
+            if (index != 0) std::cout << ',';
+            std::cout << cell_json(obstacles[index]);
+        }
+        std::cout << "]},\"initial_state\":" << state_json(match.state()) << "}" << std::endl;
+        stream_event(match.events().back());
+    }
     send_start(red, arena::Side::Red, match.state().red);
     send_start(blue, arena::Side::Blue, match.state().blue);
 
@@ -355,6 +373,11 @@ int run_demo(const char *red_path, const char *blue_path,
             throw std::runtime_error("runner returned an error: " + response);
         }
         const arena::engine::ActionOutcome outcome = match.apply(action);
+        if (stream_json) {
+            const auto &events = match.events();
+            stream_event(events[events.size() - (outcome.match_finished ? 2U : 1U)]);
+            if (outcome.match_finished) stream_event(events.back());
+        }
         previous[side_index].result = arena::ActionResult{outcome.effect};
         previous[side_index].scan = outcome.scan;
     }
@@ -369,7 +392,16 @@ int run_demo(const char *red_path, const char *blue_path,
     if (required_winner.has_value() && match.state().winner != *required_winner) {
         return 2;
     }
-    if (emit_json) {
+    if (stream_json) {
+        const auto verified = arena::engine::Match::replay(match.replay_log());
+        if (!verified.ok || verified.final_state != match.state()) {
+            throw std::runtime_error("engine replay verification failed");
+        }
+        std::cout << "{\"kind\":\"result\",\"winner\":"
+                  << json_escape(arena::engine::to_string(match.state().winner))
+                  << ",\"result\":" << json_escape(arena::engine::to_string(match.state().end_reason))
+                  << "}" << std::endl;
+    } else if (emit_json) {
         std::cout << replay_json(match.replay_log(), match.state()) << '\n';
     }
     return 0;
@@ -378,6 +410,25 @@ int run_demo(const char *red_path, const char *blue_path,
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--json-stream") {
+        std::uint64_t seed = 123456789;
+        int index = 2;
+        if (index + 1 < argc && std::string(argv[index]) == "--seed") {
+            try { seed = std::stoull(argv[index + 1]); }
+            catch (...) { std::cerr << "invalid seed\n"; return 64; }
+            index += 2;
+        }
+        if (argc - index != 2) {
+            std::cerr << "usage: arena_match_demo --json-stream [--seed N] red-runner blue-runner\n";
+            return 64;
+        }
+        try { return run_demo(argv[index], argv[index + 1], std::nullopt, seed, false, true); }
+        catch (const std::exception &error) {
+            std::cout << "{\"kind\":\"error\",\"failure_reason\":\"RUNNER_ERROR\",\"error\":"
+                      << json_escape(error.what()) << "}" << std::endl;
+            return 1;
+        }
+    }
     if (argc >= 2 && std::string(argv[1]) == "--json") {
         std::uint64_t seed = 123456789;
         int index = 2;

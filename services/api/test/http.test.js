@@ -76,6 +76,21 @@ function fixture() {
       return { confirmed: true, status: 'UPLOADED' };
     },
     async listLeaderboard() { return []; },
+    async getLeaderboardEntry(_pool, id) {
+      return id === leaderboardId ? {
+        rank: 1, submission_id: id, submission_name: 'ranked', user_id: user.id,
+        user_handle: user.handle, wins: 1, draws: 0, losses: 0,
+        win_rate: 1, points_rate: 1,
+      } : null;
+    },
+    async listSubmissionMatches(_pool, id) {
+      return id === leaderboardId ? [{
+        id: matchId, red_submission_id: id, blue_submission_id: randomUUID(),
+        opponent_name: 'opponent', opponent_user: 'other', map_seed: '7',
+        status: 'FINISHED', winner: 'RED', result_for_submission: 'WIN',
+        created_at: '2026-01-01T00:00:00Z', finished_at: '2026-01-01T00:00:01Z',
+      }] : [];
+    },
     async listMatches() { return []; },
     async getMatch(_pool, id) { return id === matchId ? { id, status: 'FINISHED' } : null; },
     async getReplay(_pool, id) {
@@ -109,6 +124,7 @@ function fixture() {
 }
 
 const matchId = randomUUID();
+const leaderboardId = randomUUID();
 
 function serve(dependencies) {
   const server = createServer({ ...dependencies, logger: { error() {}, warn() {} } });
@@ -175,6 +191,10 @@ test('submission upload, persisted status, and read APIs', async () => {
 
   response = await app.request('GET', '/leaderboard');
   assert.deepEqual(response.body.entries, []);
+  response = await app.request('GET', `/leaderboard/${leaderboardId}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.entry.rank, 1);
+  assert.equal(response.body.matches[0].result_for_submission, 'WIN');
   response = await app.request('GET', '/matches');
   assert.deepEqual(response.body.matches, []);
   response = await app.request('GET', `/matches/${matchId}`);

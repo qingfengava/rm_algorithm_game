@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install --no-install-recommends --yes cmake unzip 
 WORKDIR /src
 COPY . .
 RUN cmake -S . -B build -DARENA_BUILD_TESTS=OFF -DARENA_BUILD_RUNNER=ON \
+        -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
     && cmake --build build --target arena_baseline_runner arena_match_demo --parallel
 
 FROM node:22-bookworm-slim
@@ -18,7 +19,10 @@ COPY --from=engine-build /src/examples examples
 COPY --from=engine-build /src/CMakeLists.txt .
 COPY --from=engine-build /src/build build
 COPY services/compile-worker/package.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
+    --fetch-retries=5 --fetch-retry-factor=2 --fetch-retry-mintimeout=1000 \
+    --fetch-retry-maxtimeout=120000 --maxsockets=1 \
+    && npm cache clean --force
 COPY services/compile-worker/index.js ./index.js
 COPY services/api/db.js services/api/schema.sql services/api/storage.js ./api/
 COPY services/compile-worker/compile_submission.sh /app/compile_submission.sh

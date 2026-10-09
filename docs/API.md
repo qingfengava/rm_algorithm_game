@@ -2,7 +2,7 @@
 
 API 使用 PostgreSQL 保存业务状态，Redis 只用于提交完成后的唤醒通知，源码和编译产物保存在 S3 兼容对象存储。默认本地 Compose 使用 LocalStack S3；API 不接收源码二进制流。
 
-提交完成后由 Compile Worker 自动编译 C++23 并执行基础 bot 的红蓝双向资格赛。只有资格赛两场都获胜的提交才会进入 `QUEUED`，Scheduler 随后创建与所有当前算法的双向比赛。
+提交完成后由 Compile Worker 自动编译 C++23 并执行基础 bot 的红蓝双向资格赛。只有资格赛两场都获胜的提交才会进入 `QUEUED`（资格赛通过、等待正式匹配）。排行榜为空时它会直接提升为 `FINISHED` 并获得零战绩；排行榜已有算法时，Scheduler 只创建它与已上榜算法之间的红蓝交换两场 BO1，所有比赛完成后才提升为 `FINISHED` 并刷新排行榜。
 
 本地默认使用 LocalStack 社区版的临时 S3 状态，PostgreSQL 中的提交、比赛和回放数据仍然持久化。API 重启不会清除仍在运行的对象存储容器；需要对象状态跨容器重建保留时，生产环境应使用 S3、OSS、COS 等持久化对象存储。
 
@@ -86,10 +86,19 @@ GET /health
 GET /submissions?limit=50&offset=0
 GET /submissions/{id}
 GET /leaderboard?limit=50&offset=0
+GET /leaderboard/{submissionId}
 GET /matches?limit=50&offset=0
 GET /matches/{id}
 GET /matches/{id}/replay
 ```
+
+比赛进行中可通过网站的 WebSocket 回放连接实时接收事件：
+
+```text
+ws(s)://<host>/ws/matches/{id}?after_seq=<last_received_seq>
+```
+
+连接会先返回比赛快照，再补发 `after_seq` 之后的 PostgreSQL 事件；比赛结束时发送 `complete`。历史回放响应还会包含对象存储归档的 `archive_url`（若已归档）。
 
 排行榜、比赛和回放接口不需要登录；提交详情只允许提交所属用户读取。所有列表接口限制 `limit <= 100`。
 
@@ -99,8 +108,10 @@ GET /matches/{id}/replay
 
 ```text
 UPLOADED -> COMPILING -> COMPILE_FAILED
-                         -> QUEUED -> RUNNING -> FINISHED
-                                             -> RUNTIME_FAILED
+                         -> QUEUED（资格赛通过，等待正式匹配）
+                         -> FINISHED（已进入排行榜）
+
+正式比赛的 `RUNTIME_FAILED` 记录不会把提交直接标记为失败；它是单场比赛的终态，提交会在全部双向比赛终态后进入 `FINISHED`。
 ```
 
 `submission_artifacts` 记录源码、编译产物和编译日志对象；`compile_log` 同时保留短日志摘要，便于直接查询失败原因。比赛事件按 `(match_id, seq)` 唯一约束追加，回放接口按序读取 PostgreSQL 事件。比赛的 64 位地图种子在 JSON 中以十进制字符串返回，避免 JavaScript 精度损失。

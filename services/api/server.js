@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const submissionPath = new RegExp(`^/submissions/(${UUID})$`, 'i');
 const completePath = new RegExp(`^/submissions/(${UUID})/complete$`, 'i');
+const leaderboardEntryPath = new RegExp(`^/leaderboard/(${UUID})$`, 'i');
 const matchPath = new RegExp(`^/matches/(${UUID})$`, 'i');
 const replayPath = new RegExp(`^/matches/(${UUID})/replay$`, 'i');
 const adminUserPath = new RegExp(`^/admin/users/(${UUID})$`, 'i');
@@ -79,6 +80,10 @@ function serializeSubmission(row) {
       confirmed: Boolean(row.source_uploaded_at),
       size_bytes: row.source_size == null ? null : Number(row.source_size),
       uploaded_at: row.source_uploaded_at,
+    },
+    match_progress: {
+      total: Number(row.match_total || 0),
+      completed: Number(row.match_completed || 0),
     },
   };
 }
@@ -362,6 +367,26 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       return;
     }
 
+    const leaderboardEntry = leaderboardEntryPath.exec(path);
+    if (leaderboardEntry && request.method === 'GET') {
+      if (typeof repo.getLeaderboardEntry !== 'function' ||
+          typeof repo.listSubmissionMatches !== 'function') {
+        throw new HttpError(404, 'leaderboard_entry_not_found');
+      }
+      const id = leaderboardEntry[1];
+      const entry = await repo.getLeaderboardEntry(pool, id);
+      if (!entry) throw new HttpError(404, 'leaderboard_entry_not_found');
+      const matches = await repo.listSubmissionMatches(pool, id);
+      sendJson(response, 200, {
+        entry,
+        matches: matches.map((match) => ({
+          ...match,
+          replay_url: `/matches/${match.id}/replay`,
+        })),
+      });
+      return;
+    }
+
     if (path === '/matches' && request.method === 'GET') {
       const { limit, offset } = pagination(url.searchParams);
       const matches = await repo.listMatches(pool, limit, offset);
@@ -374,6 +399,10 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       const replay = await repo.getReplay(pool, replayId[1]);
       if (!replay) throw new HttpError(404, 'match_not_found');
       if (!replay.map || !replay.initial_state) throw new HttpError(409, 'replay_not_ready');
+      if (replay.replay_object_key && typeof storage.objectDownloadUrl === 'function') {
+        replay.archive_url = await storage.objectDownloadUrl(replay.replay_object_key);
+        replay.archive_expires_in_seconds = 300;
+      }
       sendJson(response, 200, replay);
       return;
     }
@@ -388,7 +417,8 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
 
     const known = path === '/login' || path === '/submissions' || path === '/leaderboard' ||
       path === '/matches' || submissionPath.test(path) || completePath.test(path) ||
-      matchPath.test(path) || replayPath.test(path) || path === '/healthz' || path === '/health' ||
+      leaderboardEntryPath.test(path) || matchPath.test(path) || replayPath.test(path) ||
+      path === '/healthz' || path === '/health' ||
       path.startsWith('/admin/');
     if (known) throw new HttpError(405, 'method_not_allowed');
     throw new HttpError(404, 'not_found');

@@ -167,7 +167,12 @@ async function getSubmission(pool, id, userId) {
     `SELECT s.id, s.user_id, s.name, s.status, s.is_current, s.compile_log,
             s.failure_reason, s.created_at, s.updated_at,
             a.object_key AS source_key, a.byte_size AS source_size,
-            a.uploaded_at AS source_uploaded_at
+            a.uploaded_at AS source_uploaded_at,
+            (SELECT count(*)::integer FROM matches m
+              WHERE m.red_submission_id = s.id OR m.blue_submission_id = s.id) AS match_total,
+            (SELECT count(*)::integer FROM matches m
+              WHERE (m.red_submission_id = s.id OR m.blue_submission_id = s.id)
+                AND m.status IN ('FINISHED', 'RUNTIME_FAILED')) AS match_completed
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
       WHERE s.id = $1 AND s.user_id = $2 AND s.deleted_at IS NULL`,
@@ -282,7 +287,7 @@ async function setLeaderboardOverride(pool, { submissionId, wins, draws, losses,
   for (const value of [wins, draws, losses]) if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid_leaderboard_record');
   return transaction(pool, async (client) => {
     const current = await client.query(
-      'SELECT id FROM submissions WHERE id = $1 AND is_current = true AND deleted_at IS NULL',
+      "SELECT id FROM submissions WHERE id = $1 AND is_current = true AND deleted_at IS NULL AND status = 'FINISHED'",
       [submissionId],
     );
     if (!current.rows[0]) throw new Error('submission_not_active');
@@ -308,7 +313,7 @@ async function clearAllLeaderboardOverrides(pool) {
 
 async function listReadySubmissions(pool, limit = 50) {
   const result = await pool.query(
-    `SELECT s.id, s.user_id, a.object_key AS source_key
+      `SELECT s.id, s.user_id, a.object_key AS source_key
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
       WHERE s.status = 'UPLOADED' AND s.deleted_at IS NULL AND a.uploaded_at IS NOT NULL
@@ -319,19 +324,43 @@ async function listReadySubmissions(pool, limit = 50) {
   return result.rows;
 }
 
-async function listCurrentAlgorithms(pool) {
+async function listRankedAlgorithms(pool) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.name, s.status,
             a.object_key AS runner_key, a.byte_size AS runner_size
        FROM submissions s
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
+       JOIN leaderboard_entries e ON e.submission_id = s.id
       WHERE s.is_current = true AND s.deleted_at IS NULL
-        AND s.status IN ('QUEUED', 'RUNNING', 'FINISHED')
+        AND s.status = 'FINISHED'
         AND a.uploaded_at IS NOT NULL
       ORDER BY s.created_at ASC, s.id ASC`,
   );
   return result.rows;
+}
+
+// `QUEUED` means qualification succeeded and the submission is waiting for
+// its complete set of two-sided matches. It is deliberately kept out of the
+// ranked set until those matches reach a terminal state.
+async function listPendingAlgorithms(pool) {
+  const result = await pool.query(
+    `SELECT s.id, s.user_id, s.name, s.status,
+            a.object_key AS runner_key, a.byte_size AS runner_size
+       FROM submissions s
+       JOIN submission_artifacts a
+         ON a.submission_id = s.id AND a.kind = 'COMPILED'
+      WHERE s.deleted_at IS NULL
+        AND s.status = 'QUEUED'
+        AND a.uploaded_at IS NOT NULL
+      ORDER BY s.created_at ASC, s.id ASC`,
+  );
+  return result.rows;
+}
+
+// Keep the old repository name for workers and integrations that use it.
+async function listCurrentAlgorithms(pool) {
+  return listRankedAlgorithms(pool);
 }
 
 async function getCompiledArtifacts(pool, submissionIds) {
@@ -386,10 +415,10 @@ async function listLeaderboard(pool, limit, offset) {
     `SELECT e.rank, e.submission_id, s.name AS submission_name,
             u.id AS user_id, u.handle AS user_handle,
             e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
-       FROM leaderboard_entries e
-       JOIN submissions s ON s.id = e.submission_id
-       JOIN users u ON u.id = s.user_id
-      WHERE s.deleted_at IS NULL
+      FROM leaderboard_entries e
+      JOIN submissions s ON s.id = e.submission_id
+      JOIN users u ON u.id = s.user_id
+      WHERE s.deleted_at IS NULL AND s.status = 'FINISHED'
       ORDER BY e.rank ASC, e.submission_id ASC
       LIMIT $1 OFFSET $2`,
     [limit, offset],
@@ -402,6 +431,53 @@ async function listLeaderboard(pool, limit, offset) {
     win_rate: Number(row.win_rate),
     points_rate: Number(row.points_rate),
   }));
+}
+
+async function getLeaderboardEntry(pool, submissionId) {
+  const result = await pool.query(
+    `SELECT e.rank, e.submission_id, s.name AS submission_name,
+            u.id AS user_id, u.handle AS user_handle,
+            e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
+       FROM leaderboard_entries e
+       JOIN submissions s ON s.id = e.submission_id
+       JOIN users u ON u.id = s.user_id
+      WHERE e.submission_id = $1 AND s.deleted_at IS NULL AND s.status = 'FINISHED'`,
+    [submissionId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { ...row, win_rate: Number(row.win_rate), points_rate: Number(row.points_rate) };
+}
+
+async function listSubmissionMatches(pool, submissionId) {
+  const result = await pool.query(
+    `SELECT m.id, m.red_submission_id, m.blue_submission_id,
+            rs.name AS red_name, bs.name AS blue_name,
+            ru.handle AS red_user, bu.handle AS blue_user,
+            CASE WHEN m.red_submission_id = $1 THEN m.blue_submission_id
+                 ELSE m.red_submission_id END AS opponent_submission_id,
+            CASE WHEN m.red_submission_id = $1 THEN bs.name ELSE rs.name END AS opponent_name,
+            CASE WHEN m.red_submission_id = $1 THEN bu.handle ELSE ru.handle END AS opponent_user,
+            m.map_seed::text, m.status, m.winner, m.failure_reason,
+            CASE
+              WHEN m.status = 'RUNTIME_FAILED' THEN 'RUNTIME_FAILED'
+              WHEN m.status <> 'FINISHED' THEN NULL
+              WHEN m.winner = 'DRAW' THEN 'DRAW'
+              WHEN (m.red_submission_id = $1 AND m.winner = 'RED') OR
+                   (m.blue_submission_id = $1 AND m.winner = 'BLUE') THEN 'WIN'
+              ELSE 'LOSS'
+            END AS result_for_submission,
+            m.replay_object_key, m.created_at, m.started_at, m.finished_at
+       FROM matches m
+       JOIN submissions rs ON rs.id = m.red_submission_id
+       JOIN submissions bs ON bs.id = m.blue_submission_id
+       JOIN users ru ON ru.id = rs.user_id
+       JOIN users bu ON bu.id = bs.user_id
+      WHERE m.red_submission_id = $1 OR m.blue_submission_id = $1
+      ORDER BY m.created_at ASC, m.id ASC`,
+    [submissionId],
+  );
+  return result.rows;
 }
 
 async function listMatches(pool, limit, offset) {
@@ -447,7 +523,7 @@ async function getReplay(pool, id) {
     // A repeatable-read snapshot keeps the match metadata and event list aligned.
     await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
     const match = await client.query(
-      `SELECT id, map_seed::text, map_data, initial_state, status
+      `SELECT id, map_seed::text, map_data, initial_state, status, winner, replay_object_key
          FROM matches WHERE id = $1`,
       [id],
     );
@@ -463,8 +539,18 @@ async function getReplay(pool, id) {
       initial_state: match.rows[0].initial_state,
       events: events.rows.map((row) => row.event),
       status: match.rows[0].status,
+      winner: match.rows[0].winner,
+      replay_object_key: match.rows[0].replay_object_key,
     };
   });
+}
+
+async function getMatchEventsAfter(pool, matchId, afterSeq, limit = 128) {
+  const result = await pool.query(
+    'SELECT event FROM match_events WHERE match_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3',
+    [matchId, afterSeq, limit],
+  );
+  return result.rows.map((row) => row.event);
 }
 
 // Worker-facing repository methods. Scheduler and workers share this
@@ -495,17 +581,6 @@ async function setSubmissionStatus(pool, id, status, { compileLog = null, failur
         typeof failureReason === 'string' ? failureReason.slice(0, 2048) : null, previous],
     );
     if (!result.rows[0]) return null;
-    if (status === 'QUEUED') {
-      await client.query(
-        `UPDATE submissions SET is_current = false, updated_at = now()
-          WHERE user_id = $1 AND id <> $2 AND is_current = true`,
-        [result.rows[0].user_id, id],
-      );
-      await client.query(
-        'UPDATE submissions SET is_current = true, updated_at = now() WHERE id = $1',
-        [id],
-      );
-    }
     return result.rows[0];
   });
 }
@@ -567,6 +642,111 @@ async function ensureMatchesForAlgorithms(pool, algorithms, mapSeedForPair) {
   });
 }
 
+async function ensureMatchesForSubmission(pool, pending, ranked, mapSeedForPair) {
+  if (!pending || !pending.id || !Array.isArray(ranked)) throw new Error('invalid_pending_algorithm');
+  if (typeof mapSeedForPair !== 'function') throw new Error('invalid_seed_function');
+  return transaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
+    const created = [];
+    for (const opponent of ranked) {
+      if (!opponent || !opponent.id || opponent.id === pending.id) continue;
+      const pairSeed = String(mapSeedForPair(pending.id, opponent.id));
+      for (const [red, blue] of [[pending, opponent], [opponent, pending]]) {
+        const result = await client.query(
+          `INSERT INTO matches
+             (id, red_submission_id, blue_submission_id, map_seed, status)
+           VALUES ($1, $2, $3, $4, 'QUEUED')
+           ON CONFLICT (red_submission_id, blue_submission_id, map_seed) DO NOTHING
+           RETURNING id, red_submission_id, blue_submission_id, map_seed::text, status`,
+          [crypto.randomUUID(), red.id, blue.id, pairSeed],
+        );
+        if (result.rows[0]) created.push(result.rows[0]);
+      }
+    }
+    return created;
+  });
+}
+
+async function listMatchesForSubmission(pool, submissionId) {
+  const result = await pool.query(
+    `SELECT id, red_submission_id, blue_submission_id, map_seed::text,
+            status, winner, failure_reason, created_at, started_at, finished_at
+       FROM matches
+      WHERE red_submission_id = $1 OR blue_submission_id = $1
+      ORDER BY created_at ASC, id ASC`,
+    [submissionId],
+  );
+  return result.rows;
+}
+
+async function promoteSubmissionToLeaderboard(pool, submissionId) {
+  return transaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
+    const result = await client.query(
+      `UPDATE submissions s
+          SET status = 'FINISHED', updated_at = now()
+        WHERE s.id = $1 AND s.status = 'QUEUED'
+          AND s.deleted_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM submission_artifacts a
+             WHERE a.submission_id = s.id AND a.kind = 'COMPILED'
+               AND a.uploaded_at IS NOT NULL
+          )
+        RETURNING id, user_id, status, is_current, updated_at`,
+      [submissionId],
+    );
+    if (!result.rows[0]) return null;
+    await client.query(
+      `UPDATE submissions SET is_current = false, updated_at = now()
+        WHERE user_id = $1 AND id <> $2 AND is_current = true`,
+      [result.rows[0].user_id, submissionId],
+    );
+    const current = await client.query(
+      `UPDATE submissions SET is_current = true, updated_at = now()
+        WHERE id = $1 RETURNING id, user_id, status, is_current, updated_at`,
+      [submissionId],
+    );
+    return current.rows[0] || null;
+  });
+}
+
+// Promotion and board publication share one transaction. This prevents a
+// restart between the status update and leaderboard refresh from exposing a
+// finished submission without its corresponding rank entry.
+async function promoteSubmissionAndRefresh(pool, submissionId) {
+  return transaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:leaderboard'))");
+    const candidate = await client.query(
+      `SELECT s.id, s.user_id
+         FROM submissions s
+        WHERE s.id = $1 AND s.status = 'QUEUED' AND s.deleted_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM submission_artifacts a
+             WHERE a.submission_id = s.id AND a.kind = 'COMPILED'
+               AND a.uploaded_at IS NOT NULL
+          )
+        FOR UPDATE`,
+      [submissionId],
+    );
+    if (!candidate.rows[0]) return null;
+    await client.query(
+      `UPDATE submissions SET is_current = false, updated_at = now()
+        WHERE user_id = $1 AND id <> $2 AND is_current = true`,
+      [candidate.rows[0].user_id, submissionId],
+    );
+    const promoted = await client.query(
+      `UPDATE submissions SET status = 'FINISHED', is_current = true, updated_at = now()
+        WHERE id = $1 AND status = 'QUEUED'
+        RETURNING id, user_id, status, is_current, updated_at`,
+      [submissionId],
+    );
+    if (!promoted.rows[0]) return null;
+    const leaderboard = await refreshLeaderboardInTransaction(client);
+    return { submission: promoted.rows[0], leaderboard };
+  });
+}
+
 async function startMatch(pool, id, mapData, initialState) {
   const result = await pool.query(
     `UPDATE matches SET status = 'RUNNING', map_data = $2::jsonb,
@@ -621,6 +801,44 @@ async function appendMatchEvent(pool, matchId, event) {
     `INSERT INTO match_events (match_id, seq, event) VALUES ($1, $2, $3::jsonb)`,
     [matchId, event.seq, JSON.stringify(event)],
   );
+}
+
+async function startMatchReplay(pool, matchId, replay) {
+  const result = await pool.query(
+    `UPDATE matches SET map_data = $2::jsonb, initial_state = $3::jsonb
+      WHERE id = $1 AND status = 'RUNNING' RETURNING id`,
+    [matchId, JSON.stringify(replay.map), JSON.stringify(replay.initial_state)],
+  );
+  if (result.rowCount !== 1) throw new Error('match_not_running');
+}
+
+async function completeStreamedMatch(pool, matchId, replay) {
+  if (!['RED', 'BLUE', 'DRAW'].includes(replay.winner) || !Array.isArray(replay.events) ||
+      !replay.replay_object_key) throw new Error('invalid_replay');
+  return transaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:leaderboard'))");
+    const saved = await client.query(
+      `SELECT seq, event FROM match_events WHERE match_id = $1 ORDER BY seq ASC`, [matchId],
+    );
+    if (saved.rows.length !== replay.events.length ||
+        saved.rows.some((row, index) => row.seq !== index ||
+          row.event.state_hash !== replay.events[index].state_hash ||
+          row.event.type !== replay.events[index].type)) throw new Error('replay_event_mismatch');
+    const terminal = replay.events.at(-1);
+    if (terminal?.type !== 'MATCH_ENDED' || terminal.winner !== replay.winner ||
+        terminal.state_after?.winner !== replay.winner || !terminal.state_after?.finished) {
+      throw new Error('replay_terminal_mismatch');
+    }
+    const updated = await client.query(
+      `UPDATE matches SET status = 'FINISHED', winner = $2, failure_reason = NULL,
+              replay_object_key = $3, finished_at = now()
+        WHERE id = $1 AND status = 'RUNNING' RETURNING id, status, winner`,
+      [matchId, replay.winner, replay.replay_object_key],
+    );
+    if (updated.rowCount !== 1) throw new Error('match_not_running');
+    if (await leaderboardReadyInTransaction(client)) await refreshLeaderboardInTransaction(client);
+    return updated.rows[0];
+  });
 }
 
 async function replaceMatchReplay(pool, matchId, replay) {
@@ -745,7 +963,7 @@ async function saveLeaderboardSnapshot(pool, entries) {
 async function leaderboardReadyInTransaction(client) {
   const result = await client.query([
     'WITH current_algorithms AS (',
-    '  SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL',
+    "  SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL AND status = 'FINISHED'",
     '), expected AS (',
     '  SELECT count(*)::bigint * greatest(count(*) - 1, 0)::bigint AS count',
     '    FROM current_algorithms',
@@ -771,7 +989,7 @@ async function leaderboardReadyInTransaction(client) {
 async function refreshLeaderboardInTransaction(client) {
     const result = await client.query(
       `WITH current_algorithms AS (
-             SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL
+             SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL AND status = 'FINISHED'
            ), outcomes AS (
              SELECT red_submission_id AS submission_id,
                     CASE WHEN winner = 'RED' THEN 1 ELSE 0 END AS wins,
@@ -873,22 +1091,33 @@ module.exports = {
   clearLeaderboardOverride,
   clearAllLeaderboardOverrides,
   listReadySubmissions,
+  listRankedAlgorithms,
+  listPendingAlgorithms,
   listCurrentAlgorithms,
   getCompiledArtifacts,
   confirmSubmission,
   listLeaderboard,
+  getLeaderboardEntry,
+  listSubmissionMatches,
   listMatches,
   getMatch,
   getReplay,
+  getMatchEventsAfter,
   setSubmissionStatus,
   upsertArtifact,
   createMatch,
   ensureMatchesForAlgorithms,
+  ensureMatchesForSubmission,
+  listMatchesForSubmission,
+  promoteSubmissionToLeaderboard,
+  promoteSubmissionAndRefresh,
   claimMatch,
   listQueuedMatches,
   countPendingMatches,
   startMatch,
   appendMatchEvent,
+  startMatchReplay,
+  completeStreamedMatch,
   replaceMatchReplay,
   completeMatch,
   finishMatch,

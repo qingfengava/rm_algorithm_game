@@ -43,6 +43,7 @@ fi
 
 mkdir -p "$(dirname "$output")"
 if ! timeout --signal=KILL 30s g++ -std=c++23 -O2 -pipe -Wall -Wextra \
+    -static-libstdc++ -static-libgcc \
     -I"$repo_root/sdk/include" \
     -I"$repo_root/runner/include" \
     "$repo_root/runner/src/main.cpp" \
