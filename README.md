@@ -25,6 +25,20 @@ ctest --test-dir build --output-on-failure
 docker compose up --build
 ```
 
+也可以使用根目录的一键脚本。首次运行会从 `.env.example` 创建 `.env`，之后可直接重复执行：
+
+```bash
+./run.sh                 # 构建并启动完整服务
+./run.sh status          # 查看容器状态
+./run.sh logs            # 查看全部服务日志
+./run.sh test            # 执行 Compose smoke test
+./run.sh down            # 停止服务，保留数据库和 Redis 数据
+```
+
+脚本默认等待 API 和前端健康检查通过后才返回；`./run.sh reset` 会删除本地数据库和 Redis 数据卷，
+仅应在需要清空本地环境时使用。可通过 `ARENA_DEPLOY_WAIT_SECONDS` 调整健康检查等待时间，通过
+`--no-build` 跳过镜像构建。
+
 服务地址：
 
 ```text
