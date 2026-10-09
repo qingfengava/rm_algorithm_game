@@ -6,6 +6,32 @@ const {
   mapSeedForPair,
 } = require('../index');
 
+function fakeQueue(pushed = []) {
+  return {
+    async set() { return 'OK'; },
+    async del() {},
+    async rPush(key, value) { pushed.push({ key, value: JSON.parse(value) }); },
+  };
+}
+
+function fakeRepo(overrides = {}) {
+  const calls = [];
+  const repo = {
+    calls,
+    async listRankedAlgorithms() { return []; },
+    async listPendingAlgorithms() { return []; },
+    async ensureMatchesForSubmission() { return []; },
+    async listMatchesForSubmission() { return []; },
+    async listQueuedMatches() { return []; },
+    async promoteSubmissionAndRefresh(_pool, id) { calls.push(['promote', id]); return { submission: { id } }; },
+    async promoteSubmissionIfNoOpponents(_pool, id) { calls.push(['promote-no-opponents', id]); return { submission: { id } }; },
+    ...overrides,
+  };
+  return repo;
+}
+
+const logger = { error() {} };
+
 test('pair seed is symmetric and remains a decimal uint64 string', () => {
   const first = mapSeedForPair('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
@@ -15,119 +41,119 @@ test('pair seed is symmetric and remains a decimal uint64 string', () => {
   assert.ok(BigInt(first) <= 18_446_744_073_709_551_615n);
 });
 
-test('reconcile enqueues each newly created match and is idempotent at the repository boundary', async () => {
+test('a qualified candidate gets red/blue matches against other players and they are enqueued', async () => {
   const pushed = [];
-  let calls = 0;
-  const queue = {
-    async set() { return 'OK'; },
-    async del() {},
-    async rPush(key, value) { pushed.push({ key, value: JSON.parse(value) }); },
-  };
-  const repo = {
-    async listCurrentAlgorithms() {
-      return [{ id: 'a', status: 'QUEUED' }, { id: 'b', status: 'FINISHED' }];
-    },
-    async ensureMatchesForAlgorithms() {
-      calls += 1;
-      return calls === 1 ? [
-        { id: 'm1', red_submission_id: 'a', blue_submission_id: 'b', map_seed: '7' },
-        { id: 'm2', red_submission_id: 'b', blue_submission_id: 'a', map_seed: '7' },
-      ] : [];
-    },
-    async refreshLeaderboard() {},
-  };
-  const scheduler = createScheduler({ pool: {}, queue, repo, logger: { error() {} } });
-  repo.listQueuedMatches = async () => calls === 1 ? [
-    { id: 'm1', red_submission_id: 'a', blue_submission_id: 'b', map_seed: '7' },
-    { id: 'm2', red_submission_id: 'b', blue_submission_id: 'a', map_seed: '7' },
-  ] : [];
-  assert.deepEqual(await scheduler.reconcile(), { skipped: false, created: 2, enqueued: 2 });
-  assert.deepEqual(await scheduler.reconcile(), { skipped: false, created: 0, enqueued: 0 });
-  assert.equal(pushed.length, 2);
-  assert.equal(pushed[0].key, MATCH_QUEUE);
-  assert.equal(pushed[0].value.map_seed, '7');
-});
-
-test('first qualified algorithm is promoted directly when the ranked board is empty', async () => {
-  const calls = [];
-  const queue = {
-    async set() { return 'OK'; },
-    async del() {},
-    async rPush() {},
-  };
-  const repo = {
-    async listRankedAlgorithms() { return []; },
-    async listPendingAlgorithms() { return [{ id: 'candidate', status: 'QUEUED' }]; },
-    async promoteSubmissionToLeaderboard(_pool, id) { calls.push(['promote', id]); return { id }; },
-    async refreshLeaderboard() { calls.push(['refresh']); },
-    async listQueuedMatches() { return []; },
-  };
-  const scheduler = createScheduler({ pool: {}, queue, repo, logger: { error() {} } });
-  assert.deepEqual(await scheduler.reconcile(), { skipped: false, created: 0, enqueued: 0 });
-  assert.deepEqual(calls, [['promote', 'candidate'], ['refresh']]);
-});
-
-test('qualified algorithm is matched against each ranked algorithm in both colors', async () => {
-  const pushed = [];
-  const queue = {
-    async set() { return 'OK'; },
-    async del() {},
-    async rPush(key, value) { pushed.push({ key, value: JSON.parse(value) }); },
-  };
-  const candidate = { id: 'candidate', status: 'QUEUED' };
-  const ranked = [{ id: 'ranked', status: 'FINISHED' }];
+  const candidate = { id: 'candidate', user_id: 'u1' };
+  const ranked = [{ id: 'ranked', user_id: 'u2' }];
   const matches = [
     { id: 'm-red', red_submission_id: 'candidate', blue_submission_id: 'ranked', map_seed: '9', status: 'QUEUED' },
     { id: 'm-blue', red_submission_id: 'ranked', blue_submission_id: 'candidate', map_seed: '9', status: 'QUEUED' },
   ];
-  let promoted = false;
-  let calls = 0;
-  const repo = {
+  let ensureCalls = 0;
+  const repo = fakeRepo({
     async listRankedAlgorithms() { return ranked; },
-    async listPendingAlgorithms() { return promoted ? [] : [candidate]; },
+    async listPendingAlgorithms() { return [candidate]; },
     async ensureMatchesForSubmission(_pool, pending, opponents, seed) {
-      calls += 1;
+      ensureCalls += 1;
       assert.equal(pending.id, 'candidate');
       assert.deepEqual(opponents, ranked);
       assert.equal(seed('candidate', 'ranked'), seed('ranked', 'candidate'));
-      return calls === 1 ? matches : [];
+      return ensureCalls === 1 ? matches : [];
     },
     async listMatchesForSubmission() { return matches; },
     async listQueuedMatches() { return matches; },
-    async promoteSubmissionToLeaderboard() { promoted = true; return { id: 'candidate' }; },
-    async refreshLeaderboard() {},
-  };
-  const scheduler = createScheduler({ pool: {}, queue, repo, logger: { error() {} } });
+  });
+  const scheduler = createScheduler({ pool: {}, queue: fakeQueue(pushed), repo, logger });
   const result = await scheduler.reconcile();
-  assert.equal(result.created, 2);
-  assert.equal(result.enqueued, 2);
+  assert.deepEqual(result, { skipped: false, created: 2, enqueued: 2 });
+  assert.equal(pushed[0].key, MATCH_QUEUE);
   assert.equal(pushed[0].value.map_seed, pushed[1].value.map_seed);
   assert.equal(pushed[0].value.red_submission_id, 'candidate');
   assert.equal(pushed[1].value.red_submission_id, 'ranked');
+  assert.deepEqual(repo.calls, [], 'must not promote while matches are still queued');
 });
 
-test('candidate is promoted only after both matches are terminal', async () => {
-  const queue = { async set() { return 'OK'; }, async del() {}, async rPush() {} };
-  const candidate = { id: 'candidate' };
-  const ranked = [{ id: 'ranked' }];
+test('a candidate is promoted only after every match is terminal, and a runtime failure counts as terminal', async () => {
+  const candidate = { id: 'candidate', user_id: 'u1' };
+  const ranked = [{ id: 'ranked', user_id: 'u2' }];
   let states = [
     { id: 'm1', red_submission_id: 'candidate', blue_submission_id: 'ranked', status: 'FINISHED' },
     { id: 'm2', red_submission_id: 'ranked', blue_submission_id: 'candidate', status: 'RUNNING' },
   ];
-  const calls = [];
-  const repo = {
+  const repo = fakeRepo({
     async listRankedAlgorithms() { return ranked; },
     async listPendingAlgorithms() { return [candidate]; },
-    async ensureMatchesForSubmission() { return []; },
     async listMatchesForSubmission() { return states; },
-    async listQueuedMatches() { return []; },
-    async promoteSubmissionToLeaderboard() { calls.push('promote'); return { id: 'candidate' }; },
-    async refreshLeaderboard() { calls.push('refresh'); },
+  });
+  const scheduler = createScheduler({ pool: {}, queue: fakeQueue(), repo, logger });
+  await scheduler.reconcile();
+  assert.deepEqual(repo.calls, []);
+  states = states.map((match) => ({ ...match, status: match.id === 'm2' ? 'RUNTIME_FAILED' : 'FINISHED' }));
+  await scheduler.reconcile();
+  assert.deepEqual(repo.calls, [['promote', 'candidate']]);
+});
+
+test('the owner\'s previous ranked version is not an opponent: nothing to play means immediate promotion', async () => {
+  let ensured = false;
+  const repo = fakeRepo({
+    async listRankedAlgorithms() { return [{ id: 'old-version', user_id: 'u1' }]; },
+    async listPendingAlgorithms() { return [{ id: 'new-version', user_id: 'u1' }]; },
+    async ensureMatchesForSubmission() { ensured = true; return []; },
+  });
+  const scheduler = createScheduler({ pool: {}, queue: fakeQueue(), repo, logger });
+  await scheduler.reconcile();
+  assert.equal(ensured, false, 'a player must never be scheduled against their own previous version');
+  assert.deepEqual(repo.calls, [['promote-no-opponents', 'new-version']]);
+});
+
+test('only other players\' ranked algorithms are opponents when the owner already has one', async () => {
+  const seen = [];
+  const repo = fakeRepo({
+    async listRankedAlgorithms() {
+      return [{ id: 'mine', user_id: 'u1' }, { id: 'theirs', user_id: 'u2' }];
+    },
+    async listPendingAlgorithms() { return [{ id: 'candidate', user_id: 'u1' }]; },
+    async ensureMatchesForSubmission(_pool, _pending, opponents) {
+      seen.push(...opponents.map((algorithm) => algorithm.id));
+      return [];
+    },
+  });
+  const scheduler = createScheduler({ pool: {}, queue: fakeQueue(), repo, logger });
+  await scheduler.reconcile();
+  assert.deepEqual(seen, ['theirs']);
+  assert.deepEqual(repo.calls, []);
+});
+
+test('an empty board promotes the first candidate and stops so the next one plays it', async () => {
+  const repo = fakeRepo({
+    async listPendingAlgorithms() {
+      return [{ id: 'first', user_id: 'u1' }, { id: 'second', user_id: 'u2' }];
+    },
+  });
+  const scheduler = createScheduler({ pool: {}, queue: fakeQueue(), repo, logger });
+  await scheduler.reconcile();
+  assert.deepEqual(repo.calls, [['promote-no-opponents', 'first']]);
+});
+
+test('queued matches are delivered once while the delivery marker exists', async () => {
+  const pushed = [];
+  const markers = new Set();
+  const queue = {
+    async set(key, _value, options) {
+      if (options?.NX && markers.has(key)) return null;
+      markers.add(key);
+      return 'OK';
+    },
+    async del(key) { markers.delete(key); },
+    async rPush(key, value) { pushed.push({ key, value: JSON.parse(value) }); },
   };
-  const scheduler = createScheduler({ pool: {}, queue, repo, logger: { error() {} } });
-  await scheduler.reconcile();
-  assert.deepEqual(calls, []);
-  states = states.map((match) => ({ ...match, status: 'FINISHED' }));
-  await scheduler.reconcile();
-  assert.deepEqual(calls, ['promote', 'refresh']);
+  const repo = fakeRepo({
+    async listQueuedMatches() {
+      return [{ id: 'm1', red_submission_id: 'a', blue_submission_id: 'b', map_seed: '7' }];
+    },
+  });
+  const scheduler = createScheduler({ pool: {}, queue, repo, logger });
+  assert.equal((await scheduler.reconcile()).enqueued, 1);
+  assert.equal((await scheduler.reconcile()).enqueued, 0);
+  assert.equal(pushed.length, 1);
 });

@@ -44,7 +44,7 @@ docker compose up --build
 ```text
 前端：http://localhost:8081
 API：http://localhost:8080/health
-对象存储（LocalStack S3）：http://localhost:4566
+对象存储（MinIO S3）：http://localhost:9000
 实时回放（经前端代理）：ws://localhost:8081/ws/matches/{match_id}
 ```
 

@@ -10,6 +10,9 @@ function mapSeedForPair(leftId, rightId) {
 }
 
 function createScheduler({ pool, queue, repo, logger = console }) {
+  if (!repo) {
+    throw new Error('scheduler_repository_not_configured');
+  }
   let running = false;
 
   async function enqueue(matches) {
@@ -37,65 +40,45 @@ function createScheduler({ pool, queue, repo, logger = console }) {
     return enqueued;
   }
 
+  // A player never has to beat their own previous version: it is retired as
+  // soon as the new one is promoted.
+  const sameOwner = (left, right) => left.user_id != null && left.user_id === right.user_id;
+
   async function reconcile() {
     if (running) return { skipped: true, created: 0 };
     running = true;
     try {
-      let created = [];
-      // Ranked algorithms are FINISHED submissions. A QUEUED submission has
-      // passed qualification but must not affect the board until every
-      // two-sided match against the current board is terminal.
-      const promote = async (submissionId) => {
-        if (typeof repo.promoteSubmissionAndRefresh === 'function') {
-          return repo.promoteSubmissionAndRefresh(pool, submissionId);
+      const created = [];
+      // Ranked algorithms are published FINISHED submissions. A QUEUED
+      // submission has passed qualification but must not change the board, or
+      // replace its owner's ranked version, until every match against the
+      // other players' ranked algorithms has reached a terminal state.
+      const ranked = await repo.listRankedAlgorithms(pool);
+      const pending = await repo.listPendingAlgorithms(pool);
+      for (const submission of pending) {
+        const opponents = ranked.filter((algorithm) => !sameOwner(algorithm, submission));
+        if (opponents.length === 0) {
+          // Empty board, or the only ranked algorithm is the owner's previous
+          // version. The repository re-checks under its lock because another
+          // submission may have been published since the list was read.
+          await repo.promoteSubmissionIfNoOpponents(pool, submission.id);
+          break;
         }
-        const promoted = typeof repo.promoteSubmissionToLeaderboard === 'function'
-          ? await repo.promoteSubmissionToLeaderboard(pool, submissionId) : null;
-        if (promoted && typeof repo.refreshLeaderboard === 'function') {
-          await repo.refreshLeaderboard(pool);
-        }
-        return promoted;
-      };
-      if (typeof repo.listRankedAlgorithms === 'function' &&
-          typeof repo.listPendingAlgorithms === 'function') {
-        const ranked = await repo.listRankedAlgorithms(pool);
-        const pending = await repo.listPendingAlgorithms(pool);
-
-        if (ranked.length === 0) {
-          // The first qualified algorithm is the seed of the leaderboard and
-          // has no opponent to wait for. Promote one at a time so multiple
-          // submissions cannot bypass the matching stage concurrently.
-          if (pending.length > 0) await promote(pending[0].id);
-        } else {
-          for (const submission of pending) {
-            if (typeof repo.ensureMatchesForSubmission !== 'function' ||
-                typeof repo.listMatchesForSubmission !== 'function') break;
-            const pairMatches = await repo.ensureMatchesForSubmission(
-              pool, submission, ranked, mapSeedForPair,
-            );
-            created.push(...pairMatches);
-            const matches = await repo.listMatchesForSubmission(pool, submission.id);
-            const expected = ranked.length * 2;
-            const rankedIds = new Set(ranked.map((algorithm) => String(algorithm.id)));
-            const terminal = matches.filter((match) =>
-              ['FINISHED', 'RUNTIME_FAILED'].includes(match.status) &&
-              rankedIds.has(String(match.red_submission_id === submission.id
-                ? match.blue_submission_id : match.red_submission_id)));
-            if (expected > 0 && terminal.length >= expected) {
-              await promote(submission.id);
-              // The promoted candidate becomes part of the ranked set. Stop
-              // this pass so the next pending candidate also plays against it.
-              break;
-            }
-          }
-        }
-      } else {
-        // Compatibility path for older repository test doubles. Production
-        // uses the ranked/pending flow above.
-        const algorithms = await repo.listCurrentAlgorithms(pool);
-        created = await repo.ensureMatchesForAlgorithms(pool, algorithms, mapSeedForPair);
-        if (algorithms.length < 2 && typeof repo.refreshLeaderboard === 'function') {
-          await repo.refreshLeaderboard(pool);
+        const pairMatches = await repo.ensureMatchesForSubmission(
+          pool, submission, opponents, mapSeedForPair,
+        );
+        created.push(...pairMatches);
+        const matches = await repo.listMatchesForSubmission(pool, submission.id);
+        const opponentIds = new Set(opponents.map((algorithm) => String(algorithm.id)));
+        const terminal = matches.filter((match) =>
+          ['FINISHED', 'RUNTIME_FAILED'].includes(match.status) &&
+          opponentIds.has(String(match.red_submission_id === submission.id
+            ? match.blue_submission_id : match.red_submission_id)));
+        if (terminal.length >= opponents.length * 2) {
+          await repo.promoteSubmissionAndRefresh(pool, submission.id);
+          // The promoted candidate becomes part of the ranked set. Stop this
+          // pass so the next pending candidate also plays against it.
+          break;
         }
       }
       const queued = await repo.listQueuedMatches(pool, 1000);
@@ -135,7 +118,7 @@ async function startProcess(env = process.env) {
   queue.on('error', (error) => console.error('Scheduler Redis error', error));
   await db.bootstrap(pool);
   await queue.connect();
-  const scheduler = createScheduler({ pool, queue });
+  const scheduler = createScheduler({ pool, queue, repo: db });
   const intervalMs = Number(env.SCHEDULER_INTERVAL_MS || 5000);
   const { subscriber, timer } = await scheduler.start(intervalMs);
   process.stdout.write('arena-scheduler started\n');

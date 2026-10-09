@@ -50,6 +50,36 @@ CREATE INDEX IF NOT EXISTS submissions_current_idx
 CREATE INDEX IF NOT EXISTS submissions_active_idx
     ON submissions(deleted_at, created_at DESC);
 
+-- A user owns at most two live submissions: the ranked version
+-- (is_current = true) and one candidate that is still being compiled or
+-- matched. A candidate replaces the ranked version only when it is promoted,
+-- so a failed or pending upload never removes a published algorithm.
+DROP INDEX IF EXISTS submissions_one_active_per_user_idx;
+
+-- Installations that predate this rule may hold extra live rows. Keep the
+-- newest ranked version and the newest candidate per user and soft-delete the
+-- rest before installing the guards. This is a no-op once the indexes exist.
+WITH ranked_live AS (
+    SELECT id,
+           row_number() OVER (
+               PARTITION BY user_id, is_current
+               ORDER BY created_at DESC, id DESC
+           ) AS position
+      FROM submissions
+     WHERE deleted_at IS NULL
+)
+UPDATE submissions s
+   SET deleted_at = now(), is_current = false, updated_at = now()
+  FROM ranked_live r
+ WHERE s.id = r.id AND r.position > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS submissions_one_ranked_per_user_idx
+    ON submissions(user_id)
+    WHERE is_current AND deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS submissions_one_candidate_per_user_idx
+    ON submissions(user_id)
+    WHERE NOT is_current AND deleted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS submission_artifacts (
     id uuid PRIMARY KEY,
     submission_id uuid NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
@@ -57,10 +87,16 @@ CREATE TABLE IF NOT EXISTS submission_artifacts (
     object_key text NOT NULL UNIQUE,
     content_type text NOT NULL,
     byte_size bigint CHECK (byte_size IS NULL OR byte_size >= 0),
+    -- Database backup makes a confirmed submission recoverable if the local
+    -- S3-compatible volume is recreated. It is intentionally private and is
+    -- never returned by public API queries.
+    payload bytea,
     uploaded_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (submission_id, kind)
 );
+
+ALTER TABLE submission_artifacts ADD COLUMN IF NOT EXISTS payload bytea;
 
 CREATE TABLE IF NOT EXISTS matches (
     id uuid PRIMARY KEY,
@@ -73,6 +109,10 @@ CREATE TABLE IF NOT EXISTS matches (
     map_data jsonb,
     initial_state jsonb,
     replay_object_key text,
+    retry_count integer NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    -- Platform failures (storage, database, worker crash) requeue the same
+    -- match instead of recording a result; this counts those attempts.
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
     finished_at timestamptz,
@@ -82,10 +122,13 @@ CREATE TABLE IF NOT EXISTS matches (
 
 CREATE INDEX IF NOT EXISTS matches_created_idx ON matches(created_at DESC, id DESC);
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS replay_object_key text;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS retry_count integer NOT NULL DEFAULT 0;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS matches_red_idx ON matches(red_submission_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS matches_blue_idx ON matches(blue_submission_id, created_at DESC);
+DROP INDEX IF EXISTS matches_pair_seed_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS matches_pair_seed_idx
-    ON matches(red_submission_id, blue_submission_id, map_seed);
+    ON matches(red_submission_id, blue_submission_id, map_seed, retry_count);
 
 CREATE TABLE IF NOT EXISTS match_events (
     match_id uuid NOT NULL REFERENCES matches(id) ON DELETE CASCADE,

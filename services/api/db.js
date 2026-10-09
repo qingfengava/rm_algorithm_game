@@ -23,7 +23,13 @@ function createPool(env = process.env) {
 }
 
 async function bootstrap(pool) {
-  await pool.query(await fs.readFile(schemaPath, 'utf8'));
+  // API, Scheduler and both Workers bootstrap at the same time. The schema
+  // script is idempotent, but concurrent CREATE INDEX / UPDATE statements can
+  // still race, so run it under an advisory lock.
+  await transaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:bootstrap'))");
+    await client.query(await fs.readFile(schemaPath, 'utf8'));
+  });
 }
 
 async function transaction(pool, work) {
@@ -144,8 +150,40 @@ async function issueAccessToken(pool, userId) {
   return token;
 }
 
+// A user owns one ranked version (is_current) and at most one candidate. A new
+// upload only supersedes the previous unpublished candidate: the ranked version
+// stays on the leaderboard until the new candidate has played its matches and is
+// promoted by promoteSubmissionAndRefresh.
 async function createSubmission(pool, { id, userId, name, stagingKey }) {
   return transaction(pool, async (client) => {
+    // Locking the user row makes replacing the candidate atomic even when two
+    // upload requests arrive together.
+    const user = await client.query(
+      'SELECT id FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    if (!user.rows[0]) throw new Error('user_not_found');
+    const superseded = await client.query(
+      `UPDATE submissions
+          SET deleted_at = now(), is_current = false, updated_at = now()
+        WHERE user_id = $1 AND deleted_at IS NULL AND is_current = false AND id <> $2
+        RETURNING id`,
+      [userId, id],
+    );
+    // Matches that have not started yet must not pull a superseded candidate
+    // back into the worker queue. Running matches are allowed to finish so
+    // their replay remains valid; leaderboard queries already exclude it.
+    if (superseded.rows.length > 0) {
+      await client.query(
+        `UPDATE matches
+            SET status = 'RUNTIME_FAILED',
+                failure_reason = 'SUBMISSION_REPLACED',
+                finished_at = now()
+          WHERE status = 'QUEUED'
+            AND (red_submission_id = ANY($1::uuid[]) OR blue_submission_id = ANY($1::uuid[]))`,
+        [superseded.rows.map((row) => row.id)],
+      );
+    }
     const submission = await client.query(
       `INSERT INTO submissions (id, user_id, name, status, is_current)
        VALUES ($1, $2, $3, 'UPLOADED', false)
@@ -316,7 +354,8 @@ async function listReadySubmissions(pool, limit = 50) {
       `SELECT s.id, s.user_id, a.object_key AS source_key
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.status = 'UPLOADED' AND s.deleted_at IS NULL AND a.uploaded_at IS NOT NULL
+      WHERE s.status = 'UPLOADED' AND s.deleted_at IS NULL
+        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
       ORDER BY s.created_at, s.id
       LIMIT $1`,
     [limit],
@@ -324,6 +363,10 @@ async function listReadySubmissions(pool, limit = 50) {
   return result.rows;
 }
 
+// Published algorithms that can currently be played: ranked, not replaced, and
+// with a runner in object storage or in the PostgreSQL backup. An algorithm
+// whose runner is lost for good stays on the leaderboard (see markArtifactLost)
+// but is skipped as an opponent until its owner submits again.
 async function listRankedAlgorithms(pool) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.name, s.status,
@@ -331,10 +374,9 @@ async function listRankedAlgorithms(pool) {
        FROM submissions s
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
-       JOIN leaderboard_entries e ON e.submission_id = s.id
       WHERE s.is_current = true AND s.deleted_at IS NULL
         AND s.status = 'FINISHED'
-        AND a.uploaded_at IS NOT NULL
+        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
       ORDER BY s.created_at ASC, s.id ASC`,
   );
   return result.rows;
@@ -352,15 +394,10 @@ async function listPendingAlgorithms(pool) {
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
       WHERE s.deleted_at IS NULL
         AND s.status = 'QUEUED'
-        AND a.uploaded_at IS NOT NULL
+        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
       ORDER BY s.created_at ASC, s.id ASC`,
   );
   return result.rows;
-}
-
-// Keep the old repository name for workers and integrations that use it.
-async function listCurrentAlgorithms(pool) {
-  return listRankedAlgorithms(pool);
 }
 
 async function getCompiledArtifacts(pool, submissionIds) {
@@ -371,8 +408,31 @@ async function getCompiledArtifacts(pool, submissionIds) {
        FROM submissions s
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
-      WHERE s.id = ANY($1::uuid[]) AND s.deleted_at IS NULL AND a.uploaded_at IS NOT NULL`,
+      WHERE s.id = ANY($1::uuid[]) AND s.deleted_at IS NULL
+        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)`,
     [submissionIds],
+  );
+  return result.rows;
+}
+
+async function getArtifactPayload(pool, submissionId, kind) {
+  if (!submissionId || !['SOURCE', 'COMPILED', 'COMPILE_LOG'].includes(kind)) return null;
+  const result = await pool.query(
+    `SELECT payload FROM submission_artifacts
+      WHERE submission_id = $1 AND kind = $2 AND payload IS NOT NULL`,
+    [submissionId, kind],
+  );
+  return result.rows[0]?.payload || null;
+}
+
+// Artifacts that have a private PostgreSQL backup. API start-up uses this list
+// to copy the backups into a freshly created object-storage volume.
+async function listBackedUpArtifacts(pool) {
+  const result = await pool.query(
+    `SELECT submission_id, kind, object_key, content_type
+       FROM submission_artifacts
+      WHERE payload IS NOT NULL
+      ORDER BY created_at ASC, id ASC`,
   );
   return result.rows;
 }
@@ -383,7 +443,7 @@ async function confirmSubmission(pool, { id, userId, confirmSource }) {
       `SELECT s.status, a.object_key, a.uploaded_at
          FROM submissions s
          JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-        WHERE s.id = $1 AND s.user_id = $2
+        WHERE s.id = $1 AND s.user_id = $2 AND s.deleted_at IS NULL
         FOR UPDATE OF s, a`,
       [id, userId],
     );
@@ -393,17 +453,23 @@ async function confirmSubmission(pool, { id, userId, confirmSource }) {
     }
     const stagingKey = current.rows[0].object_key;
     const finalKey = `submissions/${id}/source.zip`;
-    const byteSize = await confirmSource(stagingKey, finalKey);
+    const confirmed = await confirmSource(stagingKey, finalKey);
+    const byteSize = Number(confirmed && typeof confirmed === 'object'
+      ? confirmed.byteSize : confirmed);
+    const payload = confirmed && typeof confirmed === 'object' && confirmed.payload != null
+      ? Buffer.from(confirmed.payload) : null;
+    if (!Number.isSafeInteger(byteSize) || byteSize < 1) throw new Error('source_size_invalid');
     await client.query(
       `UPDATE submission_artifacts
-          SET object_key = $2, byte_size = $3, uploaded_at = now()
+          SET object_key = $2, byte_size = $3,
+              payload = COALESCE($4, payload), uploaded_at = now()
         WHERE submission_id = $1 AND kind = 'SOURCE'`,
-      [id, finalKey, byteSize],
+      [id, finalKey, byteSize, payload],
     );
     await client.query(
       `UPDATE submissions
           SET status = 'UPLOADED', updated_at = now()
-        WHERE id = $1`,
+        WHERE id = $1 AND deleted_at IS NULL`,
       [id],
     );
     return { confirmed: true, status: 'UPLOADED' };
@@ -412,13 +478,13 @@ async function confirmSubmission(pool, { id, userId, confirmSource }) {
 
 async function listLeaderboard(pool, limit, offset) {
   const result = await pool.query(
-    `SELECT e.rank, e.submission_id, s.name AS submission_name,
+    `SELECT e.rank, e.submission_id,
             u.id AS user_id, u.handle AS user_handle,
             e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
       FROM leaderboard_entries e
       JOIN submissions s ON s.id = e.submission_id
       JOIN users u ON u.id = s.user_id
-      WHERE s.deleted_at IS NULL AND s.status = 'FINISHED'
+      WHERE s.deleted_at IS NULL AND s.is_current = true AND s.status = 'FINISHED'
       ORDER BY e.rank ASC, e.submission_id ASC
       LIMIT $1 OFFSET $2`,
     [limit, offset],
@@ -435,13 +501,14 @@ async function listLeaderboard(pool, limit, offset) {
 
 async function getLeaderboardEntry(pool, submissionId) {
   const result = await pool.query(
-    `SELECT e.rank, e.submission_id, s.name AS submission_name,
+    `SELECT e.rank, e.submission_id,
             u.id AS user_id, u.handle AS user_handle,
             e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
        FROM leaderboard_entries e
        JOIN submissions s ON s.id = e.submission_id
        JOIN users u ON u.id = s.user_id
-      WHERE e.submission_id = $1 AND s.deleted_at IS NULL AND s.status = 'FINISHED'`,
+      WHERE e.submission_id = $1 AND s.deleted_at IS NULL
+        AND s.is_current = true AND s.status = 'FINISHED'`,
     [submissionId],
   );
   const row = result.rows[0];
@@ -452,11 +519,9 @@ async function getLeaderboardEntry(pool, submissionId) {
 async function listSubmissionMatches(pool, submissionId) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            rs.name AS red_name, bs.name AS blue_name,
             ru.handle AS red_user, bu.handle AS blue_user,
             CASE WHEN m.red_submission_id = $1 THEN m.blue_submission_id
                  ELSE m.red_submission_id END AS opponent_submission_id,
-            CASE WHEN m.red_submission_id = $1 THEN bs.name ELSE rs.name END AS opponent_name,
             CASE WHEN m.red_submission_id = $1 THEN bu.handle ELSE ru.handle END AS opponent_user,
             m.map_seed::text, m.status, m.winner, m.failure_reason,
             CASE
@@ -467,7 +532,8 @@ async function listSubmissionMatches(pool, submissionId) {
                    (m.blue_submission_id = $1 AND m.winner = 'BLUE') THEN 'WIN'
               ELSE 'LOSS'
             END AS result_for_submission,
-            m.replay_object_key, m.created_at, m.started_at, m.finished_at
+            m.replay_object_key, m.created_at, m.started_at, m.finished_at,
+            (SELECT count(*)::integer FROM match_events e WHERE e.match_id = m.id) AS event_count
        FROM matches m
        JOIN submissions rs ON rs.id = m.red_submission_id
        JOIN submissions bs ON bs.id = m.blue_submission_id
@@ -483,10 +549,10 @@ async function listSubmissionMatches(pool, submissionId) {
 async function listMatches(pool, limit, offset) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            rs.name AS red_name, bs.name AS blue_name,
             ru.handle AS red_user, bu.handle AS blue_user,
             m.map_seed::text, m.status, m.winner, m.created_at,
-            m.started_at, m.finished_at
+            m.started_at, m.finished_at, m.replay_object_key,
+            (SELECT count(*)::integer FROM match_events e WHERE e.match_id = m.id) AS event_count
        FROM matches m
        JOIN submissions rs ON rs.id = m.red_submission_id
        JOIN submissions bs ON bs.id = m.blue_submission_id
@@ -502,10 +568,10 @@ async function listMatches(pool, limit, offset) {
 async function getMatch(pool, id) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            rs.name AS red_name, bs.name AS blue_name,
             ru.handle AS red_user, bu.handle AS blue_user,
             m.map_seed::text, m.status, m.winner, m.failure_reason,
             m.created_at, m.started_at, m.finished_at,
+            m.replay_object_key,
             (SELECT count(*)::integer FROM match_events e WHERE e.match_id = m.id) AS event_count
        FROM matches m
        JOIN submissions rs ON rs.id = m.red_submission_id
@@ -574,7 +640,8 @@ async function setSubmissionStatus(pool, id, status, { compileLog = null, failur
         WHERE s.id = $1 AND s.status = $5 AND s.deleted_at IS NULL
           AND EXISTS (
             SELECT 1 FROM submission_artifacts a
-             WHERE a.submission_id = s.id AND a.kind = 'SOURCE' AND a.uploaded_at IS NOT NULL
+             WHERE a.submission_id = s.id AND a.kind = 'SOURCE'
+               AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
           )
         RETURNING id, user_id, status, updated_at`,
       [id, status, typeof compileLog === 'string' ? compileLog.slice(0, 65536) : null,
@@ -585,19 +652,24 @@ async function setSubmissionStatus(pool, id, status, { compileLog = null, failur
   });
 }
 
-async function upsertArtifact(pool, { submissionId, kind, objectKey, contentType, byteSize = null }) {
+async function upsertArtifact(pool, {
+  submissionId, kind, objectKey, contentType, byteSize = null, payload = null,
+}) {
   if (!['SOURCE', 'COMPILED', 'COMPILE_LOG'].includes(kind)) {
     throw new Error('invalid_artifact_kind');
   }
   const result = await pool.query(
     `INSERT INTO submission_artifacts
-       (id, submission_id, kind, object_key, content_type, byte_size, uploaded_at)
-     VALUES ($1, $2, $3, $4, $5, $6, now())
+       (id, submission_id, kind, object_key, content_type, byte_size, payload, uploaded_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
      ON CONFLICT (submission_id, kind) DO UPDATE SET
        object_key = EXCLUDED.object_key, content_type = EXCLUDED.content_type,
-       byte_size = EXCLUDED.byte_size, uploaded_at = EXCLUDED.uploaded_at
+       byte_size = EXCLUDED.byte_size,
+       payload = COALESCE(EXCLUDED.payload, submission_artifacts.payload),
+       uploaded_at = EXCLUDED.uploaded_at
      RETURNING id, submission_id, kind, object_key, content_type, byte_size, uploaded_at`,
-    [crypto.randomUUID(), submissionId, kind, objectKey, contentType, byteSize],
+    [crypto.randomUUID(), submissionId, kind, objectKey, contentType, byteSize,
+      payload == null ? null : Buffer.from(payload)],
   );
   return result.rows[0];
 }
@@ -612,36 +684,6 @@ async function createMatch(pool, { id = crypto.randomUUID(), redSubmissionId, bl
   return result.rows[0];
 }
 
-async function ensureMatchesForAlgorithms(pool, algorithms, mapSeedForPair) {
-  if (!Array.isArray(algorithms)) throw new Error('invalid_algorithms');
-  if (typeof mapSeedForPair !== 'function') throw new Error('invalid_seed_function');
-  return transaction(pool, async (client) => {
-    // One scheduler transaction at a time makes the create-and-enqueue pass
-    // deterministic; the unique index remains the final duplicate guard.
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
-    const created = [];
-    for (let left = 0; left < algorithms.length; left += 1) {
-      for (let right = left + 1; right < algorithms.length; right += 1) {
-        const first = algorithms[left];
-        const second = algorithms[right];
-        const mapSeed = String(mapSeedForPair(first.id, second.id));
-        for (const [red, blue] of [[first, second], [second, first]]) {
-          const result = await client.query(
-            `INSERT INTO matches
-               (id, red_submission_id, blue_submission_id, map_seed, status)
-             VALUES ($1, $2, $3, $4, 'QUEUED')
-             ON CONFLICT (red_submission_id, blue_submission_id, map_seed) DO NOTHING
-             RETURNING id, red_submission_id, blue_submission_id, map_seed::text, status`,
-            [crypto.randomUUID(), red.id, blue.id, mapSeed],
-          );
-          if (result.rows[0]) created.push(result.rows[0]);
-        }
-      }
-    }
-    return created;
-  });
-}
-
 async function ensureMatchesForSubmission(pool, pending, ranked, mapSeedForPair) {
   if (!pending || !pending.id || !Array.isArray(ranked)) throw new Error('invalid_pending_algorithm');
   if (typeof mapSeedForPair !== 'function') throw new Error('invalid_seed_function');
@@ -654,9 +696,9 @@ async function ensureMatchesForSubmission(pool, pending, ranked, mapSeedForPair)
       for (const [red, blue] of [[pending, opponent], [opponent, pending]]) {
         const result = await client.query(
           `INSERT INTO matches
-             (id, red_submission_id, blue_submission_id, map_seed, status)
-           VALUES ($1, $2, $3, $4, 'QUEUED')
-           ON CONFLICT (red_submission_id, blue_submission_id, map_seed) DO NOTHING
+             (id, red_submission_id, blue_submission_id, map_seed, retry_count, status)
+           VALUES ($1, $2, $3, $4, 0, 'QUEUED')
+           ON CONFLICT (red_submission_id, blue_submission_id, map_seed, retry_count) DO NOTHING
            RETURNING id, red_submission_id, blue_submission_id, map_seed::text, status`,
           [crypto.randomUUID(), red.id, blue.id, pairSeed],
         );
@@ -679,71 +721,172 @@ async function listMatchesForSubmission(pool, submissionId) {
   return result.rows;
 }
 
-async function promoteSubmissionToLeaderboard(pool, submissionId) {
-  return transaction(pool, async (client) => {
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
-    const result = await client.query(
-      `UPDATE submissions s
-          SET status = 'FINISHED', updated_at = now()
-        WHERE s.id = $1 AND s.status = 'QUEUED'
-          AND s.deleted_at IS NULL
-          AND EXISTS (
-            SELECT 1 FROM submission_artifacts a
-             WHERE a.submission_id = s.id AND a.kind = 'COMPILED'
-               AND a.uploaded_at IS NOT NULL
-          )
-        RETURNING id, user_id, status, is_current, updated_at`,
-      [submissionId],
-    );
-    if (!result.rows[0]) return null;
-    await client.query(
-      `UPDATE submissions SET is_current = false, updated_at = now()
-        WHERE user_id = $1 AND id <> $2 AND is_current = true`,
-      [result.rows[0].user_id, submissionId],
-    );
-    const current = await client.query(
-      `UPDATE submissions SET is_current = true, updated_at = now()
-        WHERE id = $1 RETURNING id, user_id, status, is_current, updated_at`,
-      [submissionId],
-    );
-    return current.rows[0] || null;
-  });
-}
-
-// Promotion and board publication share one transaction. This prevents a
-// restart between the status update and leaderboard refresh from exposing a
-// finished submission without its corresponding rank entry.
-async function promoteSubmissionAndRefresh(pool, submissionId) {
+// Promote a qualified candidate and publish the board in one transaction, so a
+// restart can never expose a finished submission without its rank entry, or a
+// board that has lost the user's previous version without gaining the new one.
+//
+// This is the only place a ranked version is replaced: the user's previous
+// version is retired (kept with its matches and replays, but no longer current)
+// and the leaderboard is recomputed from the matches the candidate played.
+// With onlyIfNoOpponents the promotion happens only when no other user has a
+// playable ranked algorithm, i.e. when there is nobody for the candidate to play.
+async function promoteSubmissionAndRefresh(pool, submissionId, { onlyIfNoOpponents = false } = {}) {
   return transaction(pool, async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:scheduler'))");
     await client.query("SELECT pg_advisory_xact_lock(hashtext('arena:leaderboard'))");
     const candidate = await client.query(
       `SELECT s.id, s.user_id
          FROM submissions s
-        WHERE s.id = $1 AND s.status = 'QUEUED' AND s.deleted_at IS NULL
+        WHERE s.id = $1 AND s.status = 'QUEUED' AND s.is_current = false
+          AND s.deleted_at IS NULL
           AND EXISTS (
             SELECT 1 FROM submission_artifacts a
              WHERE a.submission_id = s.id AND a.kind = 'COMPILED'
-               AND a.uploaded_at IS NOT NULL
+               AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
           )
         FOR UPDATE`,
       [submissionId],
     );
     if (!candidate.rows[0]) return null;
-    await client.query(
-      `UPDATE submissions SET is_current = false, updated_at = now()
-        WHERE user_id = $1 AND id <> $2 AND is_current = true`,
-      [candidate.rows[0].user_id, submissionId],
+    const userId = candidate.rows[0].user_id;
+    if (onlyIfNoOpponents) {
+      const opponents = await client.query(
+        `SELECT 1
+           FROM submissions o
+           JOIN submission_artifacts a
+             ON a.submission_id = o.id AND a.kind = 'COMPILED'
+          WHERE o.is_current = true AND o.deleted_at IS NULL AND o.status = 'FINISHED'
+            AND o.user_id <> $1
+            AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
+          LIMIT 1`,
+        [userId],
+      );
+      if (opponents.rows[0]) return null;
+    }
+    const retired = await client.query(
+      `UPDATE submissions
+          SET is_current = false, deleted_at = now(), updated_at = now()
+        WHERE user_id = $1 AND id <> $2 AND is_current = true AND deleted_at IS NULL
+        RETURNING id`,
+      [userId, submissionId],
     );
+    if (retired.rows.length > 0) {
+      await client.query(
+        `UPDATE matches
+            SET status = 'RUNTIME_FAILED',
+                failure_reason = 'SUBMISSION_REPLACED',
+                finished_at = now()
+          WHERE status = 'QUEUED'
+            AND (red_submission_id = ANY($1::uuid[]) OR blue_submission_id = ANY($1::uuid[]))`,
+        [retired.rows.map((row) => row.id)],
+      );
+    }
     const promoted = await client.query(
-      `UPDATE submissions SET status = 'FINISHED', is_current = true, updated_at = now()
+      `UPDATE submissions
+          SET status = 'FINISHED', is_current = true, failure_reason = NULL, updated_at = now()
         WHERE id = $1 AND status = 'QUEUED'
         RETURNING id, user_id, status, is_current, updated_at`,
       [submissionId],
     );
     if (!promoted.rows[0]) return null;
     const leaderboard = await refreshLeaderboardInTransaction(client);
-    return { submission: promoted.rows[0], leaderboard };
+    return {
+      submission: promoted.rows[0],
+      replaced: retired.rows.map((row) => row.id),
+      leaderboard,
+    };
+  });
+}
+
+// Fast path used by Compile Worker right after qualification, so a candidate
+// with nobody to play does not wait for the Scheduler's next scan.
+async function promoteSubmissionIfNoOpponents(pool, submissionId) {
+  return promoteSubmissionAndRefresh(pool, submissionId, { onlyIfNoOpponents: true });
+}
+
+// An artifact that exists in neither object storage nor the PostgreSQL backup
+// cannot be recovered. Mark it unavailable so nothing schedules it again.
+// A published submission keeps its leaderboard entry and ranking: only its
+// owner is told to submit again. An unpublished candidate has nothing to
+// protect and simply fails. The leaderboard is never touched here.
+async function markArtifactLost(pool, submissionId, kind, reason) {
+  if (!['SOURCE', 'COMPILED'].includes(kind)) throw new Error('invalid_artifact_kind');
+  const detail = `ARTIFACT_LOST: ${String(reason || `${kind}_MISSING`)}`.slice(0, 2048);
+  return transaction(pool, async (client) => {
+    const found = await client.query(
+      `SELECT s.id, s.status, s.is_current, a.payload IS NOT NULL AS has_backup
+         FROM submissions s
+         JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = $2
+        WHERE s.id = $1 AND s.deleted_at IS NULL
+        FOR UPDATE OF s, a`,
+      [submissionId, kind],
+    );
+    const row = found.rows[0];
+    if (!row) return null;
+    // The backup can still be restored by the caller; nothing is lost.
+    if (row.has_backup) return { recoverable: true, submission: { id: row.id, status: row.status } };
+    await client.query(
+      `UPDATE submission_artifacts SET uploaded_at = NULL
+        WHERE submission_id = $1 AND kind = $2`,
+      [submissionId, kind],
+    );
+    if (row.is_current) {
+      await client.query(
+        'UPDATE submissions SET failure_reason = $2, updated_at = now() WHERE id = $1',
+        [submissionId, detail],
+      );
+      return {
+        recoverable: false, preserved: true, reason: detail,
+        submission: { id: row.id, status: row.status },
+      };
+    }
+    const failed = await client.query(
+      `UPDATE submissions
+          SET status = 'COMPILE_FAILED', failure_reason = $2, updated_at = now()
+        WHERE id = $1
+        RETURNING id, status`,
+      [submissionId, detail],
+    );
+    await client.query(
+      `UPDATE matches
+          SET status = 'RUNTIME_FAILED',
+              failure_reason = 'SUBMISSION_ARTIFACT_LOST',
+              finished_at = now()
+        WHERE status = 'QUEUED'
+          AND (red_submission_id = $1 OR blue_submission_id = $1)`,
+      [submissionId],
+    );
+    return { recoverable: false, preserved: false, reason: detail, submission: failed.rows[0] };
+  });
+}
+
+// Platform failures (storage or database errors, a crashed worker) say nothing
+// about the algorithms, so they must not become a match result. The match goes
+// back to the queue and anything it partially wrote is discarded. After
+// maxAttempts the caller records a terminal failure instead, so a persistent
+// fault cannot hold a promotion back forever.
+async function requeueMatch(pool, matchId, reason, { maxAttempts = 5 } = {}) {
+  const detail = String(reason || 'PLATFORM_ERROR').slice(0, 2048);
+  return transaction(pool, async (client) => {
+    const current = await client.query(
+      "SELECT attempts FROM matches WHERE id = $1 AND status = 'RUNNING' FOR UPDATE",
+      [matchId],
+    );
+    if (!current.rows[0]) return null;
+    const attempts = Number(current.rows[0].attempts) + 1;
+    if (attempts >= maxAttempts) {
+      await client.query('UPDATE matches SET attempts = $2 WHERE id = $1', [matchId, attempts]);
+      return { requeued: false, attempts };
+    }
+    await client.query('DELETE FROM match_events WHERE match_id = $1', [matchId]);
+    await client.query(
+      `UPDATE matches
+          SET status = 'QUEUED', attempts = $2, failure_reason = $3,
+              map_data = NULL, initial_state = NULL, started_at = NULL
+        WHERE id = $1`,
+      [matchId, attempts, detail],
+    );
+    return { requeued: true, attempts };
   });
 }
 
@@ -1093,8 +1236,9 @@ module.exports = {
   listReadySubmissions,
   listRankedAlgorithms,
   listPendingAlgorithms,
-  listCurrentAlgorithms,
   getCompiledArtifacts,
+  getArtifactPayload,
+  listBackedUpArtifacts,
   confirmSubmission,
   listLeaderboard,
   getLeaderboardEntry,
@@ -1106,11 +1250,8 @@ module.exports = {
   setSubmissionStatus,
   upsertArtifact,
   createMatch,
-  ensureMatchesForAlgorithms,
   ensureMatchesForSubmission,
   listMatchesForSubmission,
-  promoteSubmissionToLeaderboard,
-  promoteSubmissionAndRefresh,
   claimMatch,
   listQueuedMatches,
   countPendingMatches,
@@ -1121,6 +1262,10 @@ module.exports = {
   replaceMatchReplay,
   completeMatch,
   finishMatch,
+  requeueMatch,
+  markArtifactLost,
+  promoteSubmissionAndRefresh,
+  promoteSubmissionIfNoOpponents,
   saveLeaderboardSnapshot,
   refreshLeaderboard,
 };

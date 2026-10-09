@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # One-command local deployment for the arena stack.
-# The script intentionally keeps persistent PostgreSQL and Redis volumes when
+# The script intentionally keeps persistent PostgreSQL, Redis, and object-storage volumes when
 # stopping services. Use `./run.sh reset` only when local data should be lost.
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +27,7 @@ Usage: ./run.sh [options] <command>
 Commands:
   up, start       Build and start the complete local service stack (default)
   down            Stop and remove containers, preserving named volumes
-  reset           Stop services and delete local database/Redis volumes
+  reset           Stop services and delete local database/Redis/object-storage volumes
   restart         Stop and start the complete stack
   status          Show container and health status
   logs [service]  Follow logs; optionally limit to one Compose service
@@ -128,7 +128,7 @@ up() {
 空域竞技场已启动：
   前端：     http://localhost:8081
   API：      http://localhost:8080/health
-  S3：       http://localhost:4566
+  S3：       http://localhost:9000
   管理员：   root / 416
 
 常用命令：
@@ -165,7 +165,7 @@ main() {
       ;;
     reset)
       (($# == 0)) || die "reset 不接受额外参数"
-      error "reset 将删除本地 PostgreSQL 和 Redis 数据卷"
+      error "reset 将删除本地 PostgreSQL、Redis 和对象存储数据卷"
       read -r -p "输入 RESET 确认：" confirmation
       [[ "$confirmation" == "RESET" ]] || die "已取消"
       "${COMPOSE[@]}" --env-file "$ENV_FILE" down --remove-orphans --volumes

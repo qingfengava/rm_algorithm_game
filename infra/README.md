@@ -13,7 +13,7 @@ docker compose up --build
 ```text
 前端：http://localhost:8081
 API：http://localhost:8080/health
-对象存储（LocalStack S3）：http://localhost:4566
+对象存储（MinIO S3）：http://localhost:9000
 PostgreSQL：localhost:5432
 Redis：localhost:6379
 ```

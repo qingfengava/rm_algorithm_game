@@ -27,17 +27,26 @@ services:
       timeout: 3s
       retries: 10
 
+  # S3-compatible object storage. Objects are written to the minio_data volume,
+  # so they survive `./run.sh down/restart`. The upstream minio/minio image is
+  # no longer published, hence the pinned community fork (same server, same S3
+  # API). The access key and secret must be at least 3 and 8 characters.
   minio:
-    image: ${OBJECT_STORAGE_IMAGE:-localstack/localstack:3.8.1}
+    image: ${OBJECT_STORAGE_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    command: ["server", "/data"]
     environment:
-      SERVICES: s3
-      AWS_DEFAULT_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: ${OBJECT_STORAGE_ACCESS_KEY:-test}
-      AWS_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      MINIO_ROOT_USER: ${OBJECT_STORAGE_ACCESS_KEY:-arena_minio}
+      MINIO_ROOT_PASSWORD: ${OBJECT_STORAGE_SECRET_KEY:-arena_minio_local_only}
+      MINIO_BROWSER: "off"
+      # MinIO rejects per-bucket CORS rules, so browser uploads from the web
+      # origin are allowed server-wide instead.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${OBJECT_STORAGE_CORS_ORIGIN:-http://localhost:8081}
     ports:
-      - "4566:4566"
+      - "9000:9000"
+    volumes:
+      - minio_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -55,12 +64,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      OBJECT_STORAGE_ENDPOINT: http://minio:4566
-      OBJECT_STORAGE_PUBLIC_ENDPOINT: ${OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://localhost:4566}
+      OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      OBJECT_STORAGE_PUBLIC_ENDPOINT: ${OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://localhost:9000}
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-arena-submissions}
       OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
-      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-test}
-      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-arena_minio}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-arena_minio_local_only}
       OBJECT_STORAGE_CORS_ORIGIN: ${OBJECT_STORAGE_CORS_ORIGIN:-http://localhost:8081}
       OBJECT_STORAGE_AUTO_CREATE: "true"
       ARENA_DEV_HANDLE: ${ARENA_DEV_HANDLE:-local_player}
@@ -115,12 +124,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      OBJECT_STORAGE_ENDPOINT: http://minio:4566
-      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:9000
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-arena-submissions}
       OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
-      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-test}
-      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-arena_minio}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-arena_minio_local_only}
       OBJECT_STORAGE_AUTO_CREATE: "true"
       COMPILE_TIMEOUT_MS: ${COMPILE_TIMEOUT_MS:-45000}
       COMPILE_INTERVAL_MS: ${COMPILE_INTERVAL_MS:-5000}
@@ -135,7 +144,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
-      - /run/arena-compile:rw,exec,nosuid,nodev,size=256m
+      # Explicit mode: after a container restart Docker would otherwise reuse the
+      # 0755 mount point and the non-root worker could not create temp directories.
+      - /run/arena-compile:rw,exec,nosuid,nodev,size=256m,mode=1777
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
@@ -156,14 +167,15 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arena_local_only}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      OBJECT_STORAGE_ENDPOINT: http://minio:4566
-      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:4566
+      OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      OBJECT_STORAGE_PUBLIC_ENDPOINT: http://minio:9000
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-arena-submissions}
       OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
-      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-test}
-      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-test}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-arena_minio}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-arena_minio_local_only}
       OBJECT_STORAGE_AUTO_CREATE: "true"
       MATCH_TIMEOUT_MS: ${MATCH_TIMEOUT_MS:-15000}
+      TMPDIR: /run/arena-match
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,6 +186,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
+      # Downloaded runners must be executable; os.tmpdir() follows TMPDIR.
+      - /run/arena-match:rw,exec,nosuid,nodev,size=128m,mode=1777
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
@@ -219,7 +233,7 @@ services:
       replay-gateway:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget --spider -q http://localhost/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1/healthz || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -242,3 +256,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  minio_data:

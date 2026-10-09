@@ -88,6 +88,33 @@ function serializeSubmission(row) {
   };
 }
 
+// Public views identify players by their account handle. Version names,
+// source links and compiler logs belong to the owner's submission view.
+function serializeLeaderboardEntry(row) {
+  return {
+    rank: row.rank, submission_id: row.submission_id,
+    user_id: row.user_id, user_handle: row.user_handle,
+    wins: row.wins, draws: row.draws, losses: row.losses,
+    win_rate: Number(row.win_rate), points_rate: Number(row.points_rate),
+    updated_at: row.updated_at,
+  };
+}
+
+function serializeMatch(row) {
+  return {
+    id: row.id, red_submission_id: row.red_submission_id,
+    blue_submission_id: row.blue_submission_id,
+    red_user: row.red_user, blue_user: row.blue_user,
+    opponent_submission_id: row.opponent_submission_id,
+    opponent_user: row.opponent_user, result_for_submission: row.result_for_submission,
+    map_seed: row.map_seed, status: row.status, winner: row.winner,
+    failure_reason: row.failure_reason, event_count: row.event_count,
+    created_at: row.created_at, started_at: row.started_at, finished_at: row.finished_at,
+    replay_url: `/matches/${row.id}/replay`,
+    replay_available: Boolean(row.replay_object_key) || Number(row.event_count) > 0,
+  };
+}
+
 function serializeAdminUser(row) {
   return {
     id: row.id, handle: row.handle, role: row.role, active: Boolean(row.active),
@@ -102,6 +129,36 @@ function serializeAdminSubmission(row) {
     deleted_at: row.deleted_at, compile_log: row.compile_log,
     failure_reason: row.failure_reason, created_at: row.created_at, updated_at: row.updated_at,
   };
+}
+
+// Copy PostgreSQL artifact backups into object storage when the object is
+// missing, for example after the storage volume was replaced. Failures are
+// logged and never stop the API: workers fall back to the same backups.
+async function restoreArtifactBackups({ pool, storage, repo, logger = console }) {
+  const summary = { restored: 0, failed: 0 };
+  if (typeof repo.listBackedUpArtifacts !== 'function' ||
+      typeof storage.objectExists !== 'function' ||
+      typeof storage.uploadBuffer !== 'function') return summary;
+  let artifacts;
+  try {
+    artifacts = await repo.listBackedUpArtifacts(pool);
+  } catch (error) {
+    logger.warn('artifact backup listing failed', error);
+    return summary;
+  }
+  for (const artifact of artifacts) {
+    try {
+      if (await storage.objectExists(artifact.object_key)) continue;
+      const payload = await repo.getArtifactPayload(pool, artifact.submission_id, artifact.kind);
+      if (!payload) continue;
+      await storage.uploadBuffer(artifact.object_key, payload, artifact.content_type);
+      summary.restored += 1;
+    } catch (error) {
+      summary.failed += 1;
+      logger.warn('artifact backup restore failed', { key: artifact.object_key, error });
+    }
+  }
+  return summary;
 }
 
 function createServer({ pool, storage, queue, repo, logger = console }) {
@@ -122,6 +179,7 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
   function repoError(error) {
     const map = {
       invalid_user: [400, 'invalid_user'], invalid_password: [400, 'invalid_password'],
+      user_not_found: [404, 'user_not_found'],
       invalid_role: [400, 'invalid_role'], no_user_changes: [400, 'no_user_changes'],
       self_admin_protected: [409, 'self_admin_protected'],
       last_admin_protected: [409, 'last_admin_protected'],
@@ -327,7 +385,16 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       const result = await repo.confirmSubmission(pool, {
         id: complete[1],
         userId: user.id,
-        confirmSource: (stagingKey, finalKey) => storage.confirmSource(stagingKey, finalKey),
+        confirmSource: async (stagingKey, finalKey) => {
+          const byteSize = await storage.confirmSource(stagingKey, finalKey);
+          // Keep a private PostgreSQL backup of the confirmed source. S3 is
+          // still the transfer path, but an object-store reset can no longer
+          // erase the only copy of a submitted algorithm.
+          const payload = typeof storage.downloadObjectToBuffer === 'function'
+            ? await storage.downloadObjectToBuffer(finalKey, 5 * 1024 * 1024)
+            : null;
+          return payload == null ? byteSize : { byteSize, payload };
+        },
       });
       if (!result) throw new HttpError(404, 'submission_not_found');
       if (result.confirmed) {
@@ -356,14 +423,16 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
         submission.source.download_url = await storage.sourceDownloadUrl(row.source_key);
         submission.source.download_expires_in_seconds = 300;
       }
-      sendJson(response, 200, { submission });
+      const matches = typeof repo.listSubmissionMatches === 'function'
+        ? await repo.listSubmissionMatches(pool, submissionId[1]) : [];
+      sendJson(response, 200, { submission, matches: matches.map(serializeMatch) });
       return;
     }
 
     if (path === '/leaderboard' && request.method === 'GET') {
       const { limit, offset } = pagination(url.searchParams);
       const entries = await repo.listLeaderboard(pool, limit, offset);
-      sendJson(response, 200, { entries, limit, offset });
+      sendJson(response, 200, { entries: entries.map(serializeLeaderboardEntry), limit, offset });
       return;
     }
 
@@ -378,11 +447,8 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       if (!entry) throw new HttpError(404, 'leaderboard_entry_not_found');
       const matches = await repo.listSubmissionMatches(pool, id);
       sendJson(response, 200, {
-        entry,
-        matches: matches.map((match) => ({
-          ...match,
-          replay_url: `/matches/${match.id}/replay`,
-        })),
+        entry: serializeLeaderboardEntry(entry),
+        matches: matches.map(serializeMatch),
       });
       return;
     }
@@ -390,7 +456,7 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     if (path === '/matches' && request.method === 'GET') {
       const { limit, offset } = pagination(url.searchParams);
       const matches = await repo.listMatches(pool, limit, offset);
-      sendJson(response, 200, { matches, limit, offset });
+      sendJson(response, 200, { matches: matches.map(serializeMatch), limit, offset });
       return;
     }
 
@@ -411,7 +477,7 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     if (matchId && request.method === 'GET') {
       const match = await repo.getMatch(pool, matchId[1]);
       if (!match) throw new HttpError(404, 'match_not_found');
-      sendJson(response, 200, { match });
+      sendJson(response, 200, { match: serializeMatch(match) });
       return;
     }
 
@@ -477,6 +543,12 @@ async function start(env = process.env) {
       await db.provisionUser(pool, env.ARENA_DEV_HANDLE, env.ARENA_DEV_TOKEN);
     }
     await retry(() => storage.ensureBucket());
+    const restored = await restoreArtifactBackups({ pool, storage, repo: db });
+    if (restored.restored || restored.failed) {
+      process.stdout.write(
+        `object storage restore: ${restored.restored} restored, ${restored.failed} failed\n`,
+      );
+    }
     await retry(async () => {
       if (!queue.isReady) {
         if (queue.isOpen) await queue.ping();
@@ -509,4 +581,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, start, HttpError };
+module.exports = { createServer, restoreArtifactBackups, start, HttpError };

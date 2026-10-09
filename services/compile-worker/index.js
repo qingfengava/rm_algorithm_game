@@ -5,6 +5,31 @@ const { spawn } = require('node:child_process');
 
 const SUBMISSION_CHANNEL = 'arena:submissions:uploaded';
 
+function isMissingObject(error) {
+  return error?.name === 'NoSuchKey' || error?.Code === 'NoSuchKey' ||
+    error?.$metadata?.httpStatusCode === 404;
+}
+
+async function downloadWithBackup(storage, repo, pool, key, submissionId, kind, destination, maxBytes) {
+  try {
+    return await storage.downloadObjectToFile(key, destination, maxBytes);
+  } catch (error) {
+    if (!isMissingObject(error) || typeof repo.getArtifactPayload !== 'function') throw error;
+    const payload = await repo.getArtifactPayload(pool, submissionId, kind);
+    if (!payload) throw error;
+    const bytes = Buffer.from(payload);
+    if (bytes.byteLength > maxBytes) throw new Error('artifact_backup_too_large');
+    await fs.writeFile(destination, bytes);
+    // Heal object storage so later readers do not need the database copy.
+    if (typeof storage.uploadBuffer === 'function') {
+      await storage.uploadBuffer(
+        key, bytes, kind === 'SOURCE' ? 'application/zip' : 'application/octet-stream',
+      ).catch(() => {});
+    }
+    return bytes.byteLength;
+  }
+}
+
 function createCompileWorker({
   pool, queue, storage, repo, command, commandArgs, logger = console,
 }) {
@@ -51,11 +76,17 @@ function createCompileWorker({
   async function processSubmission(submission) {
     const claimed = await repo.setSubmissionStatus(pool, submission.id, 'COMPILING');
     if (!claimed) return { status: 'already_claimed' };
-    const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'arena-compile-'));
-    const source = path.join(temporary, 'source.zip');
-    const runner = path.join(temporary, 'runner');
+    let temporary;
     try {
-      await storage.downloadObjectToFile(submission.source_key, source, 8 * 1024 * 1024);
+      // Inside the try: if the scratch directory cannot be created the failure
+      // must be recorded, not leave the claimed submission stuck in COMPILING.
+      temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'arena-compile-'));
+      const source = path.join(temporary, 'source.zip');
+      const runner = path.join(temporary, 'runner');
+      await downloadWithBackup(
+        storage, repo, pool, submission.source_key, submission.id, 'SOURCE', source,
+        8 * 1024 * 1024,
+      );
       const args = typeof commandArgs === 'function'
         ? commandArgs(source, runner)
         : [source, runner];
@@ -69,12 +100,14 @@ function createCompileWorker({
       }
       const objectKey = `submissions/${submission.id}/runner`;
       const byteSize = await storage.uploadFile(objectKey, runner, 'application/octet-stream');
+      const runnerPayload = await fs.readFile(runner);
       await repo.upsertArtifact(pool, {
         submissionId: submission.id,
         kind: 'COMPILED',
         objectKey,
         contentType: 'application/octet-stream',
         byteSize,
+        payload: runnerPayload,
       });
       if (result.log) {
         const logKey = `submissions/${submission.id}/compile.log`;
@@ -92,6 +125,20 @@ function createCompileWorker({
       await repo.setSubmissionStatus(pool, submission.id, 'QUEUED', {
         compileLog: result.log || 'COMPILE_OK',
       });
+      // A candidate with nobody to play (empty board, or the only ranked
+      // algorithm is the owner's previous version) is published immediately.
+      // Scheduler performs the same locked check on its next scan and handles
+      // every candidate that has opponents.
+      let promoted = null;
+      try {
+        if (typeof repo.promoteSubmissionIfNoOpponents === 'function') {
+          promoted = await repo.promoteSubmissionIfNoOpponents(pool, submission.id);
+        }
+      } catch (error) {
+        // Compilation and qualification have already succeeded. A failed
+        // publication is retried by Scheduler from the durable QUEUED row.
+        logger.warn('promotion without opponents failed', error);
+      }
       try {
         if (typeof queue.publish === 'function') {
           await queue.publish(SUBMISSION_CHANNEL, submission.id);
@@ -101,20 +148,29 @@ function createCompileWorker({
         // recoverable without rolling back a successful compilation.
         logger.warn('compile completion notification failed', error);
       }
-      return { status: 'queued' };
+      return { status: promoted ? 'finished' : 'queued' };
     } catch (error) {
       const reason = error.code || error.message || 'COMPILE_WORKER_ERROR';
       try {
-        await repo.setSubmissionStatus(pool, submission.id, 'COMPILE_FAILED', {
-          compileLog: String(reason), failureReason: String(reason),
-        });
+        // The source is in neither object storage nor the database backup. It
+        // cannot be compiled, so fail the candidate (asking for a new upload)
+        // instead of leaving it to be polled forever.
+        if (isMissingObject(error) && typeof repo.markArtifactLost === 'function') {
+          await repo.markArtifactLost(
+            pool, submission.id, 'SOURCE', `SOURCE_ARTIFACT_MISSING: ${String(reason)}`,
+          );
+        } else {
+          await repo.setSubmissionStatus(pool, submission.id, 'COMPILE_FAILED', {
+            compileLog: String(reason), failureReason: String(reason),
+          });
+        }
       } catch (statusError) {
         logger.error('failed to persist compile failure', statusError);
       }
       logger.error('compile worker failed', { submissionId: submission.id, error });
       return { status: 'failed', reason };
     } finally {
-      await fs.rm(temporary, { recursive: true, force: true });
+      if (temporary) await fs.rm(temporary, { recursive: true, force: true });
     }
   }
 

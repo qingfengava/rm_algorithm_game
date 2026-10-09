@@ -30,8 +30,23 @@ Match Worker 领取任务时使用 `QUEUED -> RUNNING` 原子更新。它下载�
 并在一个 PostgreSQL 事务中写入地图、初始状态、事件、胜者和 `FINISHED`。超时、崩溃、缺少 artifact 或非法
 裁判输出会写入 `RUNTIME_FAILED` 和 `failure_reason`。
 
-`RUNTIME_FAILED` 是比赛记录的终态；提交本身仍保持 `QUEUED`，直到它与所有已上榜算法的两场比赛均进入终态，
-然后才以 `FINISHED` 提交进入排行榜。
+`RUNTIME_FAILED` 是比赛记录的终态；提交本身仍保持 `QUEUED`，直到它与其他选手所有已上榜算法的两场比赛均进入终态，
+然后才以 `FINISHED` 提交进入排行榜，并在同一个事务中替换同一选手原来的榜上版本。
+
+**版本替换。** 每个选手最多有一个榜上版本（`is_current`）和一个候选版本，由数据库唯一索引保证。重新提交只会取消尚未
+上榜的旧候选版本；榜上版本一直保留到新候选版本晋级。晋级事务依次完成：旧榜上版本退役（软删除，比赛和回放保留，尚未开始的
+比赛标记为 `SUBMISSION_REPLACED`）、候选版本成为 `FINISHED/is_current`、按当前算法之间的比赛重新计算排行榜。
+候选版本不与同一选手的旧版本比赛；如果没有其他选手的可用榜上算法（空榜，或榜上只有它自己的旧版本），它在通过资格赛后立即晋级。
+
+**数据持久化。** 确认后的源码和编译 runner 同时保存在对象存储和 PostgreSQL 的私有 artifact 备份列中。对象存储读取失败时，
+Compile Worker 和 Match Worker 使用该备份并把对象写回存储；API 启动时也会把缺失的对象补回。因此重建对象存储不影响比赛。
+源码和 runner 在两处都找不到时（只可能发生在备份功能上线前的旧提交），该 artifact 被标记为不可用：榜上算法保留名次和战绩，
+只是不再被安排新比赛，所有者需要重新提交；尚未上榜的候选版本直接失败并提示重新提交。这一过程从不修改排行榜。
+
+**平台故障与算法失败。** `TIMEOUT`、`RUNNER_ERROR`、`INVALID_MATCH_STREAM`、`INVALID_MATCH_RESULT`、
+`COMPILED_ARTIFACT_MISSING` 是算法或比赛本身的失败，直接记录为 `RUNTIME_FAILED`。存储、数据库、Worker 进程等平台故障不代表
+算法表现：比赛放回队列并丢弃已写入的部分回放，最多尝试 `MATCH_MAX_ATTEMPTS`（默认 5）次，之后记录为
+`PLATFORM_RETRIES_EXHAUSTED`。`RUNTIME_FAILED` 比赛不计入胜率和得分率。
 
 排行榜只统计当前算法之间的 `FINISHED` 比赛：
 
