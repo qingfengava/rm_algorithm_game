@@ -6,7 +6,6 @@ const { createServer, restoreArtifactBackups } = require('../server');
 
 function fixture() {
   const submissions = new Map();
-  const registrations = new Map();
   const user = { id: randomUUID(), handle: 'test_player' };
   const otherUser = { id: randomUUID(), handle: 'other_player', role: 'PLAYER', active: true };
   const admin = { id: randomUUID(), handle: 'root', role: 'ADMIN', active: true };
@@ -19,23 +18,14 @@ function fixture() {
         ? { ...user, role: 'PLAYER' } : null;
     },
     async createRegistration(_pool, values) {
-      const row = { id: randomUUID(), real_name: values.realName, student_no: values.studentNo, qq_number: values.qqNumber, status: 'PENDING_REVIEW', created_at: '2026-01-01T00:00:00Z' };
-      registrations.set(row.id, row);
-      return { ...row, status_token: 'a'.repeat(64) };
-    },
-    async getRegistrationStatus(_pool, id, token) {
-      return token === 'a'.repeat(64) ? registrations.get(id) : null;
-    },
-    async listRegistrationRequests() { return [...registrations.values()]; },
-    async approveRegistration(_pool, id) {
-      const row = registrations.get(id); if (!row) return null;
-      if (row.status !== 'PENDING_REVIEW') throw new Error('registration_not_pending');
-      row.status = 'APPROVED';
-      return { request: { id, status: 'APPROVED' }, user: { id: randomUUID(), handle: row.student_no, real_name: row.real_name, student_no: row.student_no, qq_number: row.qq_number, role: 'PLAYER', active: true, created_at: '2026-01-01T00:00:00Z' } };
-    },
-    async rejectRegistration(_pool, id, _actor, reason) {
-      const row = registrations.get(id); if (!row) return null;
-      row.status = 'REJECTED'; row.rejection_reason = reason; return row;
+      return {
+        status: 'ACTIVE',
+        user: {
+          id: randomUUID(), handle: values.studentNo, real_name: values.realName,
+          student_no: values.studentNo, qq_number: values.qqNumber,
+          role: 'PLAYER', active: true, created_at: '2026-01-01T00:00:00Z',
+        },
+      };
     },
     async issueAccessToken() { return 'issued-token'; },
     async findUserByToken(_pool, token) {
@@ -145,7 +135,7 @@ function fixture() {
   };
   const pool = { async query() { return { rows: [{ '?column?': 1 }] }; } };
   return {
-    repo, storage, queue, pool, submissions, registrations,
+    repo, storage, queue, pool, submissions,
     markUploaded() { uploaded = true; },
     setCompileLog(id, value) { submissions.get(id).compile_log = value; },
     publishedCount() { return published; },
@@ -388,25 +378,16 @@ test('account password login issues a bearer token', async () => {
   assert.equal(response.status, 401);
 });
 
-test('registration stays pending until an administrator approves it', async () => {
+test('registration creates an active account immediately', async () => {
   const dependencies = fixture();
   const app = serve(dependencies);
   let response = await app.request('POST', '/register', {
     body: { real_name: '张三', student_no: '202012345678', qq_number: '123456789', password: 'password8' },
   });
   assert.equal(response.status, 201);
-  assert.equal(response.body.registration.status, 'PENDING_REVIEW');
-  const id = response.body.registration.id;
-  response = await app.request('GET', `/register/status/${id}?token=${response.body.status_token}`);
-  assert.equal(response.status, 200);
-  assert.equal(response.body.registration.status, 'PENDING_REVIEW');
-  response = await app.request('POST', `/admin/registrations/${id}/approve`, { token: 'secret' });
-  assert.equal(response.status, 403);
-  response = await app.request('POST', `/admin/registrations/${id}/approve`, { token: 'admin-secret' });
-  assert.equal(response.status, 200);
-  assert.equal(response.body.user.real_name, '张三');
-  response = await app.request('POST', `/admin/registrations/${id}/approve`, { token: 'admin-secret' });
-  assert.equal(response.status, 409);
+  assert.equal(response.body.registered, true);
+  assert.equal(response.body.status, 'ACTIVE');
+  assert.equal(response.body.user.display_name, '张三');
 });
 
 test('API rejects unauthenticated and invalid requests', async () => {
@@ -441,6 +422,12 @@ test('administrator APIs enforce role and manage accounts, algorithms, and board
   });
   assert.equal(response.status, 200);
   assert.equal(response.body.user.active, false);
+  response = await app.request('DELETE', `/admin/users/${userId}`, { token: 'admin-secret' });
+  assert.equal(response.status, 200);
+  response = await app.request('PATCH', `/admin/users/${userId}`, {
+    token: 'admin-secret', body: { active: true },
+  });
+  assert.equal(response.status, 200);
 
   const submissionId = randomUUID();
   dependencies.submissions.set(submissionId, {

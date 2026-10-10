@@ -1,28 +1,29 @@
-# 网站注册和管理员审核
+# 网站注册和管理员账户管理
 
-注册字段为实名、学号、QQ 号和密码。注册申请先保存到 `registration_requests`，只有管理员审核通过后才会创建正式 `users` 记录。
+注册字段为实名、学号、QQ 号和密码。注册后立即创建正式 `users` 记录，管理员不参与注册审核。
 
 ## 用户流程
 
 ```text
-注册 -> PENDING_REVIEW -> 管理员审核 -> APPROVED -> 学号登录
-                                      `-> REJECTED
+注册 -> ACTIVE -> 学号登录
 ```
 
-实名是排行榜、比赛列表和比赛详情中的公开显示名；学号是登录账号；QQ 号只用于管理员联系，不在公共页面显示。申请状态查询令牌只在注册响应中返回，数据库保存的是令牌哈希。
+实名是排行榜、比赛列表和比赛详情中的公开显示名；学号是登录账号；QQ 号只用于管理员联系，不在公共页面显示。
+
+管理员可以在账户管理页查看实名、学号和 QQ 号，并通过停用、恢复、改密和角色调整管理账户。停用账户会立即禁止登录，但不会删除该用户的算法、比赛和回放历史。
 
 ## API
 
 ```text
 POST /register
-GET  /register/status/{id}?token=...
 POST /login                         { student_no, password }
-GET  /admin/registrations
-POST /admin/registrations/{id}/approve
-POST /admin/registrations/{id}/reject { reason? }
+GET  /admin/users
+GET  /admin/users/{id}              查看完整账户信息
+PATCH /admin/users/{id}              修改角色、启用状态或密码
+DELETE /admin/users/{id}             注销（停用）账户
 ```
 
-审核通过操作在一个数据库事务中完成：锁定申请、再次检查学号、创建普通选手账户并更新申请状态。重复审核会返回冲突，待审核申请不会提前创建可登录账户。
+注册和用户创建在一个数据库事务中完成，学号重复时整个注册回滚。`DELETE /admin/users/{id}` 是可恢复的软注销，不删除历史数据；最后一个启用的管理员不能被注销或降级。
 
 密码使用现有 scrypt 哈希存储，系统不会保存明文密码。没有邮箱字段时，忘记密码由管理员人工核验学号和 QQ 后重置。
 

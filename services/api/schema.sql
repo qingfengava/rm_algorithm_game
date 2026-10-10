@@ -31,29 +31,6 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS users_student_no_unique_idx
     ON users(student_no) WHERE student_no IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS registration_requests (
-    id uuid PRIMARY KEY,
-    real_name text NOT NULL,
-    student_no text NOT NULL,
-    qq_number text NOT NULL,
-    password_hash text NOT NULL,
-    status text NOT NULL CHECK (status IN (
-        'PENDING_REVIEW', 'APPROVED', 'REJECTED', 'EXPIRED'
-    )),
-    status_token_hash char(64) NOT NULL UNIQUE,
-    reviewed_by uuid REFERENCES users(id),
-    reviewed_at timestamptz,
-    rejection_reason text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS registration_pending_student_no_idx
-    ON registration_requests(student_no)
-    WHERE status = 'PENDING_REVIEW';
-CREATE INDEX IF NOT EXISTS registration_status_created_idx
-    ON registration_requests(status, created_at DESC);
-
 CREATE TABLE IF NOT EXISTS submissions (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id),

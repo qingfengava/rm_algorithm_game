@@ -169,7 +169,7 @@ function normalizeRegistration({ realName, studentNo, qqNumber, password }) {
   if ([...real_name].length < 2 || [...real_name].length > 40 || /[\u0000-\u001f\u007f]/u.test(real_name)) {
     throw new Error('invalid_real_name');
   }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$/.test(student_no)) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$/.test(student_no)) {
     throw new Error('invalid_student_no');
   }
   if (!/^\d{5,12}$/.test(qq_number)) throw new Error('invalid_qq_number');
@@ -179,109 +179,26 @@ function normalizeRegistration({ realName, studentNo, qqNumber, password }) {
 
 async function createRegistration(pool, values) {
   const normalized = normalizeRegistration(values);
-  const id = values.id || crypto.randomUUID();
-  const statusToken = values.statusToken || crypto.randomBytes(32).toString('hex');
-  try {
-    const existing = await pool.query(
+  return transaction(pool, async (client) => {
+    const existing = await client.query(
       'SELECT id FROM users WHERE student_no = $1 OR handle = $1 LIMIT 1',
       [normalized.student_no],
     );
     if (existing.rows[0]) throw new Error('registration_already_exists');
-    const result = await pool.query(
-      `INSERT INTO registration_requests
-         (id, real_name, student_no, qq_number, password_hash, status, status_token_hash)
-       VALUES ($1, $2, $3, $4, $5, 'PENDING_REVIEW', $6)
-       RETURNING id, real_name, student_no, qq_number, status, created_at`,
-      [id, normalized.real_name, normalized.student_no, normalized.qq_number,
-        normalized.password_hash, tokenHash(statusToken)],
-    );
-    return { ...result.rows[0], status_token: statusToken };
-  } catch (error) {
-    if (error.code === '23505') throw new Error('registration_already_exists');
-    throw error;
-  }
-}
-
-async function getRegistrationStatus(pool, id, statusToken) {
-  const result = await pool.query(
-    `SELECT id, real_name, student_no, status, rejection_reason, created_at,
-            reviewed_at
-       FROM registration_requests
-      WHERE id = $1 AND status_token_hash = $2`,
-    [id, tokenHash(statusToken)],
-  );
-  return result.rows[0] || null;
-}
-
-async function listRegistrationRequests(pool, limit, offset, status = null) {
-  const params = [];
-  const conditions = [];
-  if (status) { params.push(status); conditions.push(`r.status = $${params.length}`); }
-  params.push(limit, offset);
-  const result = await pool.query(
-    `SELECT r.id, r.real_name, r.student_no, r.qq_number, r.status,
-            r.rejection_reason, r.reviewed_by, r.reviewed_at,
-            r.created_at, r.updated_at,
-            u.handle AS reviewer_handle
-       FROM registration_requests r
-       LEFT JOIN users u ON u.id = r.reviewed_by
-      ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
-      ORDER BY r.created_at ASC, r.id ASC
-      LIMIT $${params.length - 1} OFFSET $${params.length}`,
-    params,
-  );
-  return result.rows;
-}
-
-async function approveRegistration(pool, id, reviewerId) {
-  return transaction(pool, async (client) => {
-    const request = await client.query(
-      `SELECT id, real_name, student_no, qq_number, password_hash, status
-         FROM registration_requests WHERE id = $1 FOR UPDATE`, [id],
-    );
-    const row = request.rows[0];
-    if (!row) return null;
-    if (row.status !== 'PENDING_REVIEW') throw new Error('registration_not_pending');
-    const duplicate = await client.query(
-      'SELECT id FROM users WHERE student_no = $1 OR handle = $1 LIMIT 1', [row.student_no],
-    );
-    if (duplicate.rows[0]) throw new Error('student_no_already_exists');
     const userId = crypto.randomUUID();
-    const token = crypto.randomBytes(32).toString('hex');
+    const apiToken = crypto.randomBytes(32).toString('hex');
     const user = await client.query(
       `INSERT INTO users
          (id, handle, api_token_hash, password_hash, real_name, student_no, qq_number, role, active)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'PLAYER', true)
        RETURNING id, handle, real_name, student_no, qq_number, role, active, created_at`,
-      [userId, row.student_no, tokenHash(token), row.password_hash,
-        row.real_name, row.student_no, row.qq_number],
+      [userId, normalized.student_no, tokenHash(apiToken), normalized.password_hash,
+        normalized.real_name, normalized.student_no, normalized.qq_number],
     );
-    await client.query(
-      `UPDATE registration_requests
-          SET status = 'APPROVED', reviewed_by = $2, reviewed_at = now(), updated_at = now()
-        WHERE id = $1`, [id, reviewerId],
-    );
-    return { request: { id, status: 'APPROVED' }, user: user.rows[0] };
-  });
-}
-
-async function rejectRegistration(pool, id, reviewerId, reason) {
-  return transaction(pool, async (client) => {
-    const result = await client.query(
-      `UPDATE registration_requests
-          SET status = 'REJECTED', rejection_reason = $2,
-              reviewed_by = $3, reviewed_at = now(), updated_at = now()
-        WHERE id = $1 AND status = 'PENDING_REVIEW'
-        RETURNING id, real_name, student_no, qq_number, status, rejection_reason,
-                  reviewed_at`,
-      [id, reason || null, reviewerId],
-    );
-    if (!result.rows[0]) {
-      const exists = await client.query('SELECT id FROM registration_requests WHERE id = $1', [id]);
-      if (!exists.rows[0]) return null;
-      throw new Error('registration_not_pending');
-    }
-    return result.rows[0];
+    return { user: user.rows[0], status: 'ACTIVE' };
+  }).catch((error) => {
+    if (error.code === '23505') throw new Error('registration_already_exists');
+    throw error;
   });
 }
 
@@ -401,17 +318,27 @@ async function listAdminSubmissions(pool, limit, offset) {
   return result.rows;
 }
 
-async function createManagedUser(pool, { handle, password, role = 'PLAYER' }) {
+async function createManagedUser(pool, {
+  handle, password, role = 'PLAYER', realName = null, studentNo = null, qqNumber = null,
+}) {
+  if (studentNo !== null || realName !== null || qqNumber !== null) {
+    const profile = normalizeRegistration({ realName, studentNo, qqNumber, password: password || 'placeholder' });
+    handle = profile.student_no;
+    realName = profile.real_name;
+    studentNo = profile.student_no;
+    qqNumber = profile.qq_number;
+  }
   if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || !['PLAYER', 'ADMIN'].includes(role)) {
     throw new Error('invalid_user');
   }
   const id = crypto.randomUUID();
   const token = crypto.randomBytes(32).toString('hex');
   const result = await pool.query(
-    `INSERT INTO users (id, handle, api_token_hash, password_hash, role)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, handle, role, active, created_at`,
-    [id, handle, tokenHash(token), passwordHash(password), role],
+    `INSERT INTO users
+       (id, handle, api_token_hash, password_hash, real_name, student_no, qq_number, role)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id, handle, real_name, student_no, qq_number, role, active, created_at`,
+    [id, handle, tokenHash(token), passwordHash(password), realName, studentNo, qqNumber, role],
   );
   return result.rows[0];
 }
@@ -488,6 +415,7 @@ async function listReadySubmissions(pool, limit = 50) {
   const result = await pool.query(
       `SELECT s.id, s.user_id, a.object_key AS source_key
        FROM submissions s
+       JOIN users u ON u.id = s.user_id AND u.active = true
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
       WHERE s.status = 'UPLOADED' AND s.deleted_at IS NULL
         AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
@@ -507,6 +435,7 @@ async function listRankedAlgorithms(pool) {
     `SELECT s.id, s.user_id, s.name, s.status,
             a.object_key AS runner_key, a.byte_size AS runner_size
        FROM submissions s
+       JOIN users u ON u.id = s.user_id AND u.active = true
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
       WHERE s.is_current = true AND s.deleted_at IS NULL
@@ -525,6 +454,7 @@ async function listPendingAlgorithms(pool) {
     `SELECT s.id, s.user_id, s.name, s.status,
             a.object_key AS runner_key, a.byte_size AS runner_size
        FROM submissions s
+       JOIN users u ON u.id = s.user_id AND u.active = true
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
       WHERE s.deleted_at IS NULL
@@ -619,7 +549,7 @@ async function listLeaderboard(pool, limit, offset) {
       FROM leaderboard_entries e
       JOIN submissions s ON s.id = e.submission_id
       JOIN users u ON u.id = s.user_id
-      WHERE s.deleted_at IS NULL AND s.is_current = true AND s.status = 'FINISHED'
+      WHERE u.active = true AND s.deleted_at IS NULL AND s.is_current = true AND s.status = 'FINISHED'
       ORDER BY e.rank ASC, e.submission_id ASC
       LIMIT $1 OFFSET $2`,
     [limit, offset],
@@ -642,7 +572,7 @@ async function getLeaderboardEntry(pool, submissionId) {
        FROM leaderboard_entries e
        JOIN submissions s ON s.id = e.submission_id
        JOIN users u ON u.id = s.user_id
-      WHERE e.submission_id = $1 AND s.deleted_at IS NULL
+      WHERE u.active = true AND e.submission_id = $1 AND s.deleted_at IS NULL
         AND s.is_current = true AND s.status = 'FINISHED'`,
     [submissionId],
   );
@@ -1246,7 +1176,8 @@ async function saveLeaderboardSnapshot(pool, entries) {
 async function leaderboardReadyInTransaction(client) {
   const result = await client.query([
     'WITH current_algorithms AS (',
-    "  SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL AND status = 'FINISHED'",
+    "  SELECT s.id FROM submissions s JOIN users u ON u.id = s.user_id",
+    "   WHERE s.is_current = true AND s.deleted_at IS NULL AND s.status = 'FINISHED' AND u.active = true",
     '), expected AS (',
     '  SELECT count(*)::bigint * greatest(count(*) - 1, 0)::bigint AS count',
     '    FROM current_algorithms',
@@ -1272,7 +1203,8 @@ async function leaderboardReadyInTransaction(client) {
 async function refreshLeaderboardInTransaction(client) {
     const result = await client.query(
       `WITH current_algorithms AS (
-             SELECT id FROM submissions WHERE is_current = true AND deleted_at IS NULL AND status = 'FINISHED'
+             SELECT s.id FROM submissions s JOIN users u ON u.id = s.user_id
+              WHERE s.is_current = true AND s.deleted_at IS NULL AND s.status = 'FINISHED' AND u.active = true
            ), outcomes AS (
              SELECT red_submission_id AS submission_id,
                     CASE WHEN winner = 'RED' THEN 1 ELSE 0 END AS wins,
@@ -1362,10 +1294,6 @@ module.exports = {
   issueAccessToken,
   normalizeRegistration,
   createRegistration,
-  getRegistrationStatus,
-  listRegistrationRequests,
-  approveRegistration,
-  rejectRegistration,
   ensurePasswordUser,
   createSubmission,
   getSubmission,

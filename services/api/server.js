@@ -10,8 +10,6 @@ const replayPath = new RegExp(`^/matches/(${UUID})/replay$`, 'i');
 const adminUserPath = new RegExp(`^/admin/users/(${UUID})$`, 'i');
 const adminSubmissionPath = new RegExp(`^/admin/submissions/(${UUID})$`, 'i');
 const adminLeaderboardPath = new RegExp(`^/admin/leaderboard/(${UUID})$`, 'i');
-const registrationStatusPath = new RegExp(`^/register/status/(${UUID})$`, 'i');
-const adminRegistrationPath = new RegExp(`^/admin/registrations/(${UUID})/(approve|reject)$`, 'i');
 const MAX_METADATA_BYTES = 16 * 1024;
 
 class HttpError extends Error {
@@ -127,21 +125,6 @@ function serializeAdminUser(row) {
   };
 }
 
-function serializeRegistration(row) {
-  return {
-    id: row.id,
-    real_name: row.real_name,
-    student_no: row.student_no,
-    qq_number: row.qq_number,
-    status: row.status,
-    rejection_reason: row.rejection_reason || null,
-    reviewed_by: row.reviewer_handle || row.reviewed_by || null,
-    reviewed_at: row.reviewed_at || null,
-    created_at: row.created_at,
-    updated_at: row.updated_at || null,
-  };
-}
-
 function serializeAdminSubmission(row) {
   return {
     id: row.id, user_id: row.user_id, user_handle: row.user_handle,
@@ -210,10 +193,6 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       invalid_student_no: [400, 'invalid_student_no'],
       invalid_qq_number: [400, 'invalid_qq_number'],
       registration_already_exists: [409, 'registration_already_exists'],
-      registration_not_pending: [409, 'registration_not_pending'],
-      student_no_already_exists: [409, 'student_no_already_exists'],
-      invalid_registration_status: [400, 'invalid_registration_status'],
-      invalid_rejection_reason: [400, 'invalid_rejection_reason'],
     };
     const value = map[error?.message];
     return value ? new HttpError(value[0], value[1]) : error;
@@ -233,26 +212,17 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
           password: body.password,
         });
         sendJson(response, 201, {
-          registration: {
-            id: registration.id,
-            status: registration.status,
-            real_name: registration.real_name,
-            student_no: registration.student_no,
-            created_at: registration.created_at,
+          registered: true,
+          status: registration.status,
+          user: {
+            id: registration.user.id,
+            display_name: registration.user.real_name || registration.user.handle,
+            student_no: registration.user.student_no,
+            role: registration.user.role,
           },
-          status_token: registration.status_token,
-        }, { location: `/register/status/${registration.id}` });
+          message: '注册成功，请使用学号和密码登录。',
+        });
       } catch (error) { throw repoError(error); }
-      return;
-    }
-
-    const registrationStatus = registrationStatusPath.exec(path);
-    if (registrationStatus && request.method === 'GET') {
-      const token = url.searchParams.get('token') || '';
-      if (!/^[a-f0-9]{32,128}$/i.test(token)) throw new HttpError(404, 'registration_not_found');
-      const registration = await repo.getRegistrationStatus(pool, registrationStatus[1], token);
-      if (!registration) throw new HttpError(404, 'registration_not_found');
-      sendJson(response, 200, { registration: serializeRegistration(registration) });
       return;
     }
 
@@ -306,46 +276,6 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       return;
     }
 
-    if (path === '/admin/registrations' && request.method === 'GET') {
-      await adminUser(request);
-      const { limit, offset } = pagination(url.searchParams);
-      const status = url.searchParams.get('status') || null;
-      if (status && !['PENDING_REVIEW', 'APPROVED', 'REJECTED', 'EXPIRED'].includes(status)) {
-        throw new HttpError(400, 'invalid_registration_status');
-      }
-      const rows = await repo.listRegistrationRequests(pool, limit, offset, status);
-      sendJson(response, 200, {
-        registrations: rows.map(serializeRegistration), limit, offset,
-      });
-      return;
-    }
-
-    const adminRegistration = adminRegistrationPath.exec(path);
-    if (adminRegistration && request.method === 'POST') {
-      const actor = await adminUser(request);
-      const id = adminRegistration[1];
-      try {
-        if (adminRegistration[2] === 'approve') {
-          const result = await repo.approveRegistration(pool, id, actor.id);
-          if (!result) throw new HttpError(404, 'registration_not_found');
-          sendJson(response, 200, {
-            registration: result.request,
-            user: serializeAdminUser(result.user),
-          });
-        } else {
-          const body = await readJson(request);
-          const reason = body.reason === undefined || body.reason === null ? null : body.reason;
-          if (reason !== null && (typeof reason !== 'string' || reason.length > 500)) {
-            throw new HttpError(400, 'invalid_rejection_reason');
-          }
-          const result = await repo.rejectRegistration(pool, id, actor.id, reason);
-          if (!result) throw new HttpError(404, 'registration_not_found');
-          sendJson(response, 200, { registration: serializeRegistration(result) });
-        }
-      } catch (error) { throw repoError(error); }
-      return;
-    }
-
     if (path === '/admin/users' && request.method === 'GET') {
       await adminUser(request);
       const { limit, offset } = pagination(url.searchParams);
@@ -358,12 +288,17 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       await adminUser(request);
       const body = await readJson(request);
       const handle = typeof body.handle === 'string' ? body.handle.trim() : '';
+      const realName = body.real_name === undefined ? null : body.real_name;
+      const studentNo = body.student_no === undefined ? null : body.student_no;
+      const qqNumber = body.qq_number === undefined ? null : body.qq_number;
       const password = typeof body.password === 'string' ? body.password : '';
       const role = body.role === undefined ? 'PLAYER' : body.role;
-      if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || password.length < 1 ||
+      if ((!handle && studentNo === null) || password.length < 1 ||
           !['PLAYER', 'ADMIN'].includes(role)) throw new HttpError(400, 'invalid_user');
       try {
-        const created = await repo.createManagedUser(pool, { handle, password, role });
+        const created = await repo.createManagedUser(pool, {
+          handle, password, role, realName, studentNo, qqNumber,
+        });
         sendJson(response, 201, { user: serializeAdminUser(created) }, { location: `/admin/users/${created.id}` });
       } catch (error) {
         if (error.code === '23505') throw new HttpError(409, 'handle_already_exists');
@@ -373,6 +308,13 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     }
 
     const adminUserMatch = adminUserPath.exec(path);
+    if (adminUserMatch && request.method === 'GET') {
+      await adminUser(request);
+      const target = await repo.getUserById(pool, adminUserMatch[1]);
+      if (!target) throw new HttpError(404, 'user_not_found');
+      sendJson(response, 200, { user: serializeAdminUser(target) });
+      return;
+    }
     if (adminUserMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
       const actor = await adminUser(request);
       const id = adminUserMatch[1];
@@ -594,7 +536,6 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     const known = path === '/login' || path === '/register' || path === '/submissions' || path === '/leaderboard' ||
       path === '/matches' || submissionPath.test(path) || completePath.test(path) ||
       leaderboardEntryPath.test(path) || matchPath.test(path) || replayPath.test(path) ||
-      registrationStatusPath.test(path) || path === '/admin/registrations' || adminRegistrationPath.test(path) ||
       path === '/healthz' || path === '/health' ||
       path.startsWith('/admin/');
     if (known) throw new HttpError(405, 'method_not_allowed');
