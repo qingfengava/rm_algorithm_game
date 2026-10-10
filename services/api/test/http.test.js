@@ -43,10 +43,10 @@ function fixture() {
     },
     async getSubmission(_pool, id, userId) {
       const row = submissions.get(id);
-      return row?.user_id === userId && !row.deleted_at ? row : null;
+      return row?.user_id === userId ? row : null;
     },
     async listSubmissions(_pool, userId) {
-      return [...submissions.values()].filter((row) => row.user_id === userId && !row.deleted_at);
+      return [...submissions.values()].filter((row) => row.user_id === userId);
     },
     async listUsers() { return [...users.values()]; },
     async createManagedUser(_pool, values) {
@@ -238,13 +238,15 @@ test('a new upload supersedes only the unpublished candidate and keeps the ranke
   response = await app.request('GET', '/submissions', { token: 'secret' });
   assert.deepEqual(
     response.body.submissions.map((submission) => [submission.id, submission.is_current]).sort(),
-    [[rankedId, true], [newCandidateId, false]].sort(),
+    [[rankedId, true], [oldCandidateId, false], [newCandidateId, false]].sort(),
   );
   response = await app.request('GET', `/submissions/${rankedId}`, { token: 'secret' });
   assert.equal(response.status, 200);
   assert.equal(response.body.submission.status, 'FINISHED');
   response = await app.request('GET', `/submissions/${oldCandidateId}`, { token: 'secret' });
-  assert.equal(response.status, 404);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.submission.deleted_at, '2026-01-01T00:00:00.500Z');
+  assert.equal(response.body.submission.upload, undefined);
   response = await app.request('POST', `/submissions/${oldCandidateId}/complete`, { token: 'secret' });
   assert.equal(response.status, 404);
 });

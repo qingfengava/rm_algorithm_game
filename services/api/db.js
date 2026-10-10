@@ -203,7 +203,7 @@ async function createSubmission(pool, { id, userId, name, stagingKey }) {
 async function getSubmission(pool, id, userId) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.name, s.status, s.is_current, s.compile_log,
-            s.failure_reason, s.created_at, s.updated_at,
+            s.failure_reason, s.deleted_at, s.created_at, s.updated_at,
             a.object_key AS source_key, a.byte_size AS source_size,
             a.uploaded_at AS source_uploaded_at,
             (SELECT count(*)::integer FROM matches m
@@ -213,7 +213,7 @@ async function getSubmission(pool, id, userId) {
                 AND m.status IN ('FINISHED', 'RUNTIME_FAILED')) AS match_completed
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.id = $1 AND s.user_id = $2 AND s.deleted_at IS NULL`,
+      WHERE s.id = $1 AND s.user_id = $2`,
     [id, userId],
   );
   return result.rows[0] || null;
@@ -222,12 +222,12 @@ async function getSubmission(pool, id, userId) {
 async function listSubmissions(pool, userId, limit, offset) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.name, s.status, s.compile_log,
-            s.failure_reason, s.created_at, s.updated_at, s.is_current,
+            s.failure_reason, s.deleted_at, s.created_at, s.updated_at, s.is_current,
             a.byte_size AS source_size, a.uploaded_at AS source_uploaded_at
        FROM submissions s
        LEFT JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.user_id = $1 AND s.deleted_at IS NULL
+      WHERE s.user_id = $1
       ORDER BY s.created_at DESC, s.id DESC
       LIMIT $2 OFFSET $3`,
     [userId, limit, offset],

@@ -74,6 +74,7 @@ function serializeSubmission(row) {
     is_current: Boolean(row.is_current),
     compile_log: row.compile_log,
     failure_reason: row.failure_reason,
+    deleted_at: row.deleted_at || null,
     created_at: row.created_at,
     updated_at: row.updated_at,
     source: {
@@ -417,7 +418,7 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       const row = await repo.getSubmission(pool, submissionId[1], user.id);
       if (!row) throw new HttpError(404, 'submission_not_found');
       const submission = serializeSubmission(row);
-      if (!row.source_uploaded_at) {
+      if (!row.deleted_at && !row.source_uploaded_at) {
         submission.upload = await storage.createUploadForm(row.source_key);
       } else if (row.source_uploaded_at) {
         submission.source.download_url = await storage.sourceDownloadUrl(row.source_key);

@@ -32,8 +32,13 @@ async function main() {
     await db.createSubmission(scoped, {
       id: redId, userId: user.id, name: 'red', stagingKey: `uploads/${redId}/test.zip`,
     });
-    assert.equal(await db.getSubmission(scoped, supersededId, user.id), null);
-    assert.equal((await db.listSubmissions(scoped, user.id)).map((row) => row.id).join(','), redId);
+    const superseded = await db.getSubmission(scoped, supersededId, user.id);
+    assert.equal(superseded.id, supersededId);
+    assert.ok(superseded.deleted_at);
+    assert.deepEqual(
+      (await db.listSubmissions(scoped, user.id, 50, 0)).map((row) => row.id).sort(),
+      [supersededId, redId].sort(),
+    );
     const deleted = await client.query(
       'SELECT deleted_at, is_current FROM submissions WHERE id = $1', [supersededId],
     );
@@ -140,7 +145,7 @@ async function main() {
     });
     assert.deepEqual((await live(user.id)).map((row) => [row.id, row.is_current]),
       [[redId, true], [newId, false]], 'only the previous candidate is superseded');
-    assert.equal(await db.getSubmission(scoped, firstCandidateId, user.id), null);
+    assert.equal((await db.getSubmission(scoped, firstCandidateId, user.id)).id, firstCandidateId);
     assert.deepEqual((await ranking()).map((row) => row.id), [redId, blueId]);
 
     // Restarting a service re-runs the schema script. It must not retire the
@@ -188,7 +193,10 @@ async function main() {
     ]);
     assert.deepEqual(await live(user.id), [{ id: newId, status: 'FINISHED', is_current: true }]);
     assert.equal((await db.getMatch(scoped, match.id)).winner, 'RED', 'old match history is kept');
-    assert.deepEqual((await db.listSubmissions(scoped, user.id)).map((row) => row.id), [newId]);
+    assert.deepEqual(
+      (await db.listSubmissions(scoped, user.id, 50, 0)).map((row) => row.id).sort(),
+      [supersededId, redId, firstCandidateId, newId].sort(),
+    );
 
     // --- Database guards. -----------------------------------------------
     await assert.rejects(
