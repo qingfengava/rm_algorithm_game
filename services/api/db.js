@@ -125,7 +125,8 @@ async function ensurePasswordUser(pool, { handle, password, role = 'PLAYER' }) {
 
 async function findUserByToken(pool, token) {
   const result = await pool.query(
-    'SELECT id, handle, role, active FROM users WHERE api_token_hash = $1 AND active = true',
+    `SELECT id, handle, real_name, student_no, role, active
+       FROM users WHERE api_token_hash = $1 AND active = true`,
     [tokenHash(token)],
   );
   return result.rows[0] || null;
@@ -133,12 +134,20 @@ async function findUserByToken(pool, token) {
 
 async function findUserByCredentials(pool, handle, password) {
   const result = await pool.query(
-    'SELECT id, handle, role, password_hash FROM users WHERE handle = $1 AND active = true',
+    `SELECT id, handle, real_name, student_no, role, password_hash
+       FROM users
+      WHERE (student_no = $1 OR handle = $1) AND active = true`,
     [handle],
   );
   const user = result.rows[0];
   if (!user || !verifyPassword(password, user.password_hash)) return null;
-  return { id: user.id, handle: user.handle, role: user.role };
+  return {
+    id: user.id,
+    handle: user.handle,
+    real_name: user.real_name,
+    student_no: user.student_no,
+    role: user.role,
+  };
 }
 
 async function issueAccessToken(pool, userId) {
@@ -148,6 +157,132 @@ async function issueAccessToken(pool, userId) {
     [userId, tokenHash(token)],
   );
   return token;
+}
+
+function normalizeRegistration({ realName, studentNo, qqNumber, password }) {
+  const real_name = typeof realName === 'string' ? realName.normalize('NFC').trim() : '';
+  const student_no = typeof studentNo === 'string' ? studentNo.trim() : '';
+  const qq_number = typeof qqNumber === 'string' ? qqNumber.trim() : '';
+  if (!real_name || !student_no || !qq_number || typeof password !== 'string') {
+    throw new Error('invalid_registration');
+  }
+  if ([...real_name].length < 2 || [...real_name].length > 40 || /[\u0000-\u001f\u007f]/u.test(real_name)) {
+    throw new Error('invalid_real_name');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$/.test(student_no)) {
+    throw new Error('invalid_student_no');
+  }
+  if (!/^\d{5,12}$/.test(qq_number)) throw new Error('invalid_qq_number');
+  if (password.length < 8 || password.length > 128) throw new Error('invalid_password');
+  return { real_name, student_no, qq_number, password_hash: passwordHash(password) };
+}
+
+async function createRegistration(pool, values) {
+  const normalized = normalizeRegistration(values);
+  const id = values.id || crypto.randomUUID();
+  const statusToken = values.statusToken || crypto.randomBytes(32).toString('hex');
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE student_no = $1 OR handle = $1 LIMIT 1',
+      [normalized.student_no],
+    );
+    if (existing.rows[0]) throw new Error('registration_already_exists');
+    const result = await pool.query(
+      `INSERT INTO registration_requests
+         (id, real_name, student_no, qq_number, password_hash, status, status_token_hash)
+       VALUES ($1, $2, $3, $4, $5, 'PENDING_REVIEW', $6)
+       RETURNING id, real_name, student_no, qq_number, status, created_at`,
+      [id, normalized.real_name, normalized.student_no, normalized.qq_number,
+        normalized.password_hash, tokenHash(statusToken)],
+    );
+    return { ...result.rows[0], status_token: statusToken };
+  } catch (error) {
+    if (error.code === '23505') throw new Error('registration_already_exists');
+    throw error;
+  }
+}
+
+async function getRegistrationStatus(pool, id, statusToken) {
+  const result = await pool.query(
+    `SELECT id, real_name, student_no, status, rejection_reason, created_at,
+            reviewed_at
+       FROM registration_requests
+      WHERE id = $1 AND status_token_hash = $2`,
+    [id, tokenHash(statusToken)],
+  );
+  return result.rows[0] || null;
+}
+
+async function listRegistrationRequests(pool, limit, offset, status = null) {
+  const params = [];
+  const conditions = [];
+  if (status) { params.push(status); conditions.push(`r.status = $${params.length}`); }
+  params.push(limit, offset);
+  const result = await pool.query(
+    `SELECT r.id, r.real_name, r.student_no, r.qq_number, r.status,
+            r.rejection_reason, r.reviewed_by, r.reviewed_at,
+            r.created_at, r.updated_at,
+            u.handle AS reviewer_handle
+       FROM registration_requests r
+       LEFT JOIN users u ON u.id = r.reviewed_by
+      ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
+      ORDER BY r.created_at ASC, r.id ASC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+  return result.rows;
+}
+
+async function approveRegistration(pool, id, reviewerId) {
+  return transaction(pool, async (client) => {
+    const request = await client.query(
+      `SELECT id, real_name, student_no, qq_number, password_hash, status
+         FROM registration_requests WHERE id = $1 FOR UPDATE`, [id],
+    );
+    const row = request.rows[0];
+    if (!row) return null;
+    if (row.status !== 'PENDING_REVIEW') throw new Error('registration_not_pending');
+    const duplicate = await client.query(
+      'SELECT id FROM users WHERE student_no = $1 OR handle = $1 LIMIT 1', [row.student_no],
+    );
+    if (duplicate.rows[0]) throw new Error('student_no_already_exists');
+    const userId = crypto.randomUUID();
+    const token = crypto.randomBytes(32).toString('hex');
+    const user = await client.query(
+      `INSERT INTO users
+         (id, handle, api_token_hash, password_hash, real_name, student_no, qq_number, role, active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PLAYER', true)
+       RETURNING id, handle, real_name, student_no, qq_number, role, active, created_at`,
+      [userId, row.student_no, tokenHash(token), row.password_hash,
+        row.real_name, row.student_no, row.qq_number],
+    );
+    await client.query(
+      `UPDATE registration_requests
+          SET status = 'APPROVED', reviewed_by = $2, reviewed_at = now(), updated_at = now()
+        WHERE id = $1`, [id, reviewerId],
+    );
+    return { request: { id, status: 'APPROVED' }, user: user.rows[0] };
+  });
+}
+
+async function rejectRegistration(pool, id, reviewerId, reason) {
+  return transaction(pool, async (client) => {
+    const result = await client.query(
+      `UPDATE registration_requests
+          SET status = 'REJECTED', rejection_reason = $2,
+              reviewed_by = $3, reviewed_at = now(), updated_at = now()
+        WHERE id = $1 AND status = 'PENDING_REVIEW'
+        RETURNING id, real_name, student_no, qq_number, status, rejection_reason,
+                  reviewed_at`,
+      [id, reason || null, reviewerId],
+    );
+    if (!result.rows[0]) {
+      const exists = await client.query('SELECT id FROM registration_requests WHERE id = $1', [id]);
+      if (!exists.rows[0]) return null;
+      throw new Error('registration_not_pending');
+    }
+    return result.rows[0];
+  });
 }
 
 // A user owns one ranked version (is_current) and at most one candidate. A new
@@ -237,7 +372,7 @@ async function listSubmissions(pool, userId, limit, offset) {
 
 async function listUsers(pool, limit, offset) {
   const result = await pool.query(
-    `SELECT id, handle, role, active, created_at
+    `SELECT id, handle, real_name, student_no, qq_number, role, active, created_at
        FROM users ORDER BY created_at ASC, id ASC LIMIT $1 OFFSET $2`,
     [limit, offset],
   );
@@ -246,7 +381,7 @@ async function listUsers(pool, limit, offset) {
 
 async function getUserById(pool, id) {
   const result = await pool.query(
-    'SELECT id, handle, role, active, created_at FROM users WHERE id = $1',
+    'SELECT id, handle, real_name, student_no, qq_number, role, active, created_at FROM users WHERE id = $1',
     [id],
   );
   return result.rows[0] || null;
@@ -254,7 +389,7 @@ async function getUserById(pool, id) {
 
 async function listAdminSubmissions(pool, limit, offset) {
   const result = await pool.query(
-    `SELECT s.id, s.user_id, u.handle AS user_handle, s.name, s.status,
+    `SELECT s.id, s.user_id, COALESCE(u.real_name, u.handle) AS user_handle, s.name, s.status,
             s.is_current, s.deleted_at, s.compile_log, s.failure_reason,
             s.created_at, s.updated_at
        FROM submissions s
@@ -479,7 +614,7 @@ async function confirmSubmission(pool, { id, userId, confirmSource }) {
 async function listLeaderboard(pool, limit, offset) {
   const result = await pool.query(
     `SELECT e.rank, e.submission_id,
-            u.id AS user_id, u.handle AS user_handle,
+            u.id AS user_id, COALESCE(u.real_name, u.handle) AS user_handle,
             e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
       FROM leaderboard_entries e
       JOIN submissions s ON s.id = e.submission_id
@@ -502,7 +637,7 @@ async function listLeaderboard(pool, limit, offset) {
 async function getLeaderboardEntry(pool, submissionId) {
   const result = await pool.query(
     `SELECT e.rank, e.submission_id,
-            u.id AS user_id, u.handle AS user_handle,
+            u.id AS user_id, COALESCE(u.real_name, u.handle) AS user_handle,
             e.wins, e.draws, e.losses, e.win_rate, e.points_rate, e.updated_at
        FROM leaderboard_entries e
        JOIN submissions s ON s.id = e.submission_id
@@ -519,10 +654,13 @@ async function getLeaderboardEntry(pool, submissionId) {
 async function listSubmissionMatches(pool, submissionId) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            ru.handle AS red_user, bu.handle AS blue_user,
+            COALESCE(ru.real_name, ru.handle) AS red_user,
+            COALESCE(bu.real_name, bu.handle) AS blue_user,
             CASE WHEN m.red_submission_id = $1 THEN m.blue_submission_id
                  ELSE m.red_submission_id END AS opponent_submission_id,
-            CASE WHEN m.red_submission_id = $1 THEN bu.handle ELSE ru.handle END AS opponent_user,
+            CASE WHEN m.red_submission_id = $1
+                 THEN COALESCE(bu.real_name, bu.handle)
+                 ELSE COALESCE(ru.real_name, ru.handle) END AS opponent_user,
             m.map_seed::text, m.status, m.winner, m.failure_reason,
             CASE
               WHEN m.status = 'RUNTIME_FAILED' THEN 'RUNTIME_FAILED'
@@ -549,7 +687,8 @@ async function listSubmissionMatches(pool, submissionId) {
 async function listMatches(pool, limit, offset) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            ru.handle AS red_user, bu.handle AS blue_user,
+            COALESCE(ru.real_name, ru.handle) AS red_user,
+            COALESCE(bu.real_name, bu.handle) AS blue_user,
             m.map_seed::text, m.status, m.winner, m.created_at,
             m.started_at, m.finished_at, m.replay_object_key,
             (SELECT count(*)::integer FROM match_events e WHERE e.match_id = m.id) AS event_count
@@ -568,7 +707,8 @@ async function listMatches(pool, limit, offset) {
 async function getMatch(pool, id) {
   const result = await pool.query(
     `SELECT m.id, m.red_submission_id, m.blue_submission_id,
-            ru.handle AS red_user, bu.handle AS blue_user,
+            COALESCE(ru.real_name, ru.handle) AS red_user,
+            COALESCE(bu.real_name, bu.handle) AS blue_user,
             m.map_seed::text, m.status, m.winner, m.failure_reason,
             m.created_at, m.started_at, m.finished_at,
             m.replay_object_key,
@@ -1220,6 +1360,12 @@ module.exports = {
   findUserByToken,
   findUserByCredentials,
   issueAccessToken,
+  normalizeRegistration,
+  createRegistration,
+  getRegistrationStatus,
+  listRegistrationRequests,
+  approveRegistration,
+  rejectRegistration,
   ensurePasswordUser,
   createSubmission,
   getSubmission,

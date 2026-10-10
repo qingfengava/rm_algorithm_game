@@ -10,6 +10,8 @@ const replayPath = new RegExp(`^/matches/(${UUID})/replay$`, 'i');
 const adminUserPath = new RegExp(`^/admin/users/(${UUID})$`, 'i');
 const adminSubmissionPath = new RegExp(`^/admin/submissions/(${UUID})$`, 'i');
 const adminLeaderboardPath = new RegExp(`^/admin/leaderboard/(${UUID})$`, 'i');
+const registrationStatusPath = new RegExp(`^/register/status/(${UUID})$`, 'i');
+const adminRegistrationPath = new RegExp(`^/admin/registrations/(${UUID})/(approve|reject)$`, 'i');
 const MAX_METADATA_BYTES = 16 * 1024;
 
 class HttpError extends Error {
@@ -118,8 +120,25 @@ function serializeMatch(row) {
 
 function serializeAdminUser(row) {
   return {
-    id: row.id, handle: row.handle, role: row.role, active: Boolean(row.active),
+    id: row.id, handle: row.handle, real_name: row.real_name || null,
+    student_no: row.student_no || null, qq_number: row.qq_number || null,
+    role: row.role, active: Boolean(row.active),
     created_at: row.created_at,
+  };
+}
+
+function serializeRegistration(row) {
+  return {
+    id: row.id,
+    real_name: row.real_name,
+    student_no: row.student_no,
+    qq_number: row.qq_number,
+    status: row.status,
+    rejection_reason: row.rejection_reason || null,
+    reviewed_by: row.reviewer_handle || row.reviewed_by || null,
+    reviewed_at: row.reviewed_at || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at || null,
   };
 }
 
@@ -186,6 +205,15 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       last_admin_protected: [409, 'last_admin_protected'],
       invalid_leaderboard_record: [400, 'invalid_leaderboard_record'],
       submission_not_active: [409, 'submission_not_active'],
+      invalid_registration: [400, 'invalid_registration'],
+      invalid_real_name: [400, 'invalid_real_name'],
+      invalid_student_no: [400, 'invalid_student_no'],
+      invalid_qq_number: [400, 'invalid_qq_number'],
+      registration_already_exists: [409, 'registration_already_exists'],
+      registration_not_pending: [409, 'registration_not_pending'],
+      student_no_already_exists: [409, 'student_no_already_exists'],
+      invalid_registration_status: [400, 'invalid_registration_status'],
+      invalid_rejection_reason: [400, 'invalid_rejection_reason'],
     };
     const value = map[error?.message];
     return value ? new HttpError(value[0], value[1]) : error;
@@ -195,11 +223,46 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname;
 
+    if (request.method === 'POST' && path === '/register') {
+      const body = await readJson(request);
+      try {
+        const registration = await repo.createRegistration(pool, {
+          realName: body.real_name,
+          studentNo: body.student_no,
+          qqNumber: body.qq_number,
+          password: body.password,
+        });
+        sendJson(response, 201, {
+          registration: {
+            id: registration.id,
+            status: registration.status,
+            real_name: registration.real_name,
+            student_no: registration.student_no,
+            created_at: registration.created_at,
+          },
+          status_token: registration.status_token,
+        }, { location: `/register/status/${registration.id}` });
+      } catch (error) { throw repoError(error); }
+      return;
+    }
+
+    const registrationStatus = registrationStatusPath.exec(path);
+    if (registrationStatus && request.method === 'GET') {
+      const token = url.searchParams.get('token') || '';
+      if (!/^[a-f0-9]{32,128}$/i.test(token)) throw new HttpError(404, 'registration_not_found');
+      const registration = await repo.getRegistrationStatus(pool, registrationStatus[1], token);
+      if (!registration) throw new HttpError(404, 'registration_not_found');
+      sendJson(response, 200, { registration: serializeRegistration(registration) });
+      return;
+    }
+
     if (request.method === 'POST' && path === '/login') {
       const body = await readJson(request);
-      const handle = typeof body.handle === 'string' ? body.handle.trim() : '';
+      const handle = typeof body.student_no === 'string'
+        ? body.student_no.trim()
+        : typeof body.handle === 'string' ? body.handle.trim() : '';
       const password = typeof body.password === 'string' ? body.password : '';
-      if (!/^[A-Za-z0-9_-]{3,32}$/.test(handle) || password.length < 1) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$/.test(handle) || password.length < 1) {
         throw new HttpError(400, 'invalid_credentials');
       }
       const user = await repo.findUserByCredentials(pool, handle, password);
@@ -208,7 +271,13 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       sendJson(response, 200, {
         token,
         token_type: 'Bearer',
-        user: { id: user.id, handle: user.handle, role: user.role },
+        user: {
+          id: user.id,
+          handle: user.handle,
+          display_name: user.real_name || user.handle,
+          student_no: user.student_no || null,
+          role: user.role,
+        },
       });
       return;
     }
@@ -234,6 +303,46 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
         service: 'arena-api',
         dependencies,
       });
+      return;
+    }
+
+    if (path === '/admin/registrations' && request.method === 'GET') {
+      await adminUser(request);
+      const { limit, offset } = pagination(url.searchParams);
+      const status = url.searchParams.get('status') || null;
+      if (status && !['PENDING_REVIEW', 'APPROVED', 'REJECTED', 'EXPIRED'].includes(status)) {
+        throw new HttpError(400, 'invalid_registration_status');
+      }
+      const rows = await repo.listRegistrationRequests(pool, limit, offset, status);
+      sendJson(response, 200, {
+        registrations: rows.map(serializeRegistration), limit, offset,
+      });
+      return;
+    }
+
+    const adminRegistration = adminRegistrationPath.exec(path);
+    if (adminRegistration && request.method === 'POST') {
+      const actor = await adminUser(request);
+      const id = adminRegistration[1];
+      try {
+        if (adminRegistration[2] === 'approve') {
+          const result = await repo.approveRegistration(pool, id, actor.id);
+          if (!result) throw new HttpError(404, 'registration_not_found');
+          sendJson(response, 200, {
+            registration: result.request,
+            user: serializeAdminUser(result.user),
+          });
+        } else {
+          const body = await readJson(request);
+          const reason = body.reason === undefined || body.reason === null ? null : body.reason;
+          if (reason !== null && (typeof reason !== 'string' || reason.length > 500)) {
+            throw new HttpError(400, 'invalid_rejection_reason');
+          }
+          const result = await repo.rejectRegistration(pool, id, actor.id, reason);
+          if (!result) throw new HttpError(404, 'registration_not_found');
+          sendJson(response, 200, { registration: serializeRegistration(result) });
+        }
+      } catch (error) { throw repoError(error); }
       return;
     }
 
@@ -482,9 +591,10 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       return;
     }
 
-    const known = path === '/login' || path === '/submissions' || path === '/leaderboard' ||
+    const known = path === '/login' || path === '/register' || path === '/submissions' || path === '/leaderboard' ||
       path === '/matches' || submissionPath.test(path) || completePath.test(path) ||
       leaderboardEntryPath.test(path) || matchPath.test(path) || replayPath.test(path) ||
+      registrationStatusPath.test(path) || path === '/admin/registrations' || adminRegistrationPath.test(path) ||
       path === '/healthz' || path === '/health' ||
       path.startsWith('/admin/');
     if (known) throw new HttpError(405, 'method_not_allowed');
