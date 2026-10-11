@@ -3,7 +3,18 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { MAX_COMPILED_BYTES } = require('../api/limits');
+// The image copies shared API modules beside the worker entrypoint, while the
+// source-tree tests resolve them from the sibling api service.
+function loadLimits() {
+  try {
+    return require('./api/limits');
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND') throw error;
+    return require('../api/limits');
+  }
+}
+
+const { MAX_COMPILED_BYTES } = loadLimits();
 
 const MATCH_QUEUE = 'arena:matches:queue';
 
