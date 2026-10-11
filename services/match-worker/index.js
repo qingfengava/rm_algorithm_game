@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { MAX_COMPILED_BYTES } = require('../api/limits');
 
 const MATCH_QUEUE = 'arena:matches:queue';
 
@@ -27,11 +28,11 @@ function isMissingObject(error) {
     error?.$metadata?.httpStatusCode === 404;
 }
 
-async function downloadRunner(storage, key, destination) {
+async function downloadRunner(storage, key, destination, maxBytes = MAX_COMPILED_BYTES) {
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await storage.downloadObjectToFile(key, destination);
+      return await storage.downloadObjectToFile(key, destination, maxBytes);
     } catch (error) {
       lastError = error;
       if (!isMissingObject(error) || attempt === 2) throw error;
@@ -49,7 +50,7 @@ async function downloadRunnerWithBackup(storage, repo, pool, artifact, destinati
     const payload = await repo.getArtifactPayload(pool, artifact.submission_id, 'COMPILED');
     if (!payload) throw error;
     const bytes = Buffer.from(payload);
-    if (bytes.byteLength > 256 * 1024 * 1024) throw new Error('artifact_backup_too_large');
+    if (bytes.byteLength > MAX_COMPILED_BYTES) throw new Error('compiled_artifact_too_large');
     await fs.writeFile(destination, bytes);
     // Heal object storage so later readers do not need the database copy.
     if (typeof storage.uploadBuffer === 'function') {

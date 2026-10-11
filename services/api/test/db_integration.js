@@ -55,7 +55,7 @@ async function main() {
           assert.equal(finalKey, `submissions/${id}/source.zip`);
           return 263;
         },
-      }), { confirmed: true, status: 'UPLOADED' });
+      }), { confirmed: true, status: 'UPLOADED', stagingKey: `uploads/${id}/test.zip` });
     }
     assert.equal((await db.listReadySubmissions(scoped)).length, 2);
     await db.setSubmissionStatus(scoped, redId, 'COMPILING', { compileLog: 'compiling' });

@@ -24,7 +24,7 @@ RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
     --fetch-retry-maxtimeout=120000 --maxsockets=1 \
     && npm cache clean --force
 COPY services/compile-worker/index.js ./index.js
-COPY services/api/db.js services/api/schema.sql services/api/storage.js ./api/
+COPY services/api/db.js services/api/schema.sql services/api/storage.js services/api/limits.js ./api/
 COPY services/compile-worker/compile_submission.sh /app/compile_submission.sh
 RUN chmod 755 /app/compile_submission.sh
 USER node

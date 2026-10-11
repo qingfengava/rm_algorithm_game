@@ -9,7 +9,7 @@ RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
     && npm cache clean --force
 
 COPY services/scheduler/index.js ./index.js
-COPY services/api/db.js services/api/schema.sql ./api/
+COPY services/api/db.js services/api/schema.sql services/api/limits.js ./api/
 
 USER node
 CMD ["node", "index.js"]

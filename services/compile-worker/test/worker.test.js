@@ -141,6 +141,30 @@ test('a candidate that stays queued is left for the Scheduler when it has oppone
   assert.deepEqual(calls, ['COMPILING', 'QUEUED', 'promote']);
 });
 
+test('a compiled runner above 32 MiB is rejected before it is stored', async () => {
+  const calls = [];
+  const worker = createCompileWorker({
+    pool: {}, queue: {}, storage: {
+      async downloadObjectToFile() {},
+      async uploadFile() { throw new Error('must not upload an oversized runner'); },
+    },
+    command: process.execPath,
+    commandArgs: (_source, runner) => [
+      '-e', 'require("node:fs").writeFileSync(process.argv[1], Buffer.alloc(32 * 1024 * 1024 + 1))', runner,
+    ],
+    repo: {
+      async setSubmissionStatus(_pool, _id, status, values) {
+        calls.push({ status, reason: values?.failureReason });
+        return { id: 's1' };
+      },
+    },
+  });
+  const result = await worker.processSubmission({ id: 's1', source_key: 'source.zip' });
+  assert.equal(result.status, 'failed');
+  assert.deepEqual(calls.map((call) => call.status), ['COMPILING', 'COMPILE_FAILED']);
+  assert.equal(calls[1].reason, 'COMPILED_ARTIFACT_TOO_LARGE');
+});
+
 test('a scratch directory that cannot be created fails the claimed submission instead of leaving it COMPILING', async () => {
   const os = require('node:os');
   const original = os.tmpdir;

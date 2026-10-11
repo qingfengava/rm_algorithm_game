@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Pool } = require('pg');
+const { MAX_COMPILED_BYTES, MAX_SUBMISSION_HISTORY } = require('./limits');
 
 const schemaPath = path.join(__dirname, 'schema.sql');
 
@@ -252,6 +253,114 @@ async function createSubmission(pool, { id, userId, name, stagingKey }) {
   });
 }
 
+// Keep at most ten historical versions visible to each owner, plus the one
+// currently ranked version. The currently ranked version is always retained
+// so a long sequence of failed candidates cannot remove the algorithm that is
+// still on the leaderboard. Older rows are
+// hidden immediately; their source and compiled artifacts are removed when
+// no running match still needs them.
+async function pruneSubmissionHistory(pool, userId, limit = MAX_SUBMISSION_HISTORY) {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('invalid_history_limit');
+  return transaction(pool, async (client) => {
+    const owner = await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (!owner.rows[0]) throw new Error('user_not_found');
+    const all = await client.query(
+      `SELECT id, is_current, history_deleted_at
+         FROM submissions
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
+        FOR UPDATE`,
+      [userId],
+    );
+    const keep = new Set();
+    const current = all.rows.find((row) => row.is_current);
+    if (current) keep.add(current.id);
+    let historyKept = 0;
+    for (const row of all.rows) {
+      if (row.is_current || historyKept >= limit) continue;
+      keep.add(row.id);
+      historyKept += 1;
+    }
+    const pruneIds = all.rows
+      .filter((row) => !keep.has(row.id) && !row.is_current)
+      .map((row) => row.id);
+    if (pruneIds.length === 0) {
+      return { retained: [...keep], pruned: [], deleted: [], deferred: [], objectKeys: [] };
+    }
+
+    await client.query(
+      `UPDATE submissions
+          SET history_deleted_at = COALESCE(history_deleted_at, now()),
+              deleted_at = COALESCE(deleted_at, now()),
+              is_current = false, updated_at = now()
+        WHERE id = ANY($1::uuid[])`,
+      [pruneIds],
+    );
+    // A queued match must not be picked up after its submission leaves the
+    // retained history. A running match is allowed to finish and is cleaned
+    // up by a later pruning pass.
+    await client.query(
+      `UPDATE matches
+          SET status = 'RUNTIME_FAILED',
+              failure_reason = 'SUBMISSION_HISTORY_PRUNED',
+              finished_at = now()
+        WHERE status = 'QUEUED'
+          AND (red_submission_id = ANY($1::uuid[]) OR blue_submission_id = ANY($1::uuid[]))`,
+      [pruneIds],
+    );
+
+    const running = await client.query(
+      `SELECT DISTINCT s.id
+         FROM submissions s
+         JOIN matches m
+           ON m.status = 'RUNNING'
+          AND (m.red_submission_id = s.id OR m.blue_submission_id = s.id)
+        WHERE s.id = ANY($1::uuid[])`,
+      [pruneIds],
+    );
+    const deferred = new Set(running.rows.map((row) => row.id));
+    const deletable = pruneIds.filter((id) => !deferred.has(id));
+    if (deletable.length === 0) {
+      return {
+        retained: [...keep], pruned: pruneIds, deleted: [], deferred: [...deferred], objectKeys: [],
+      };
+    }
+
+    const artifacts = await client.query(
+      `SELECT object_key FROM submission_artifacts WHERE submission_id = ANY($1::uuid[])`,
+      [deletable],
+    );
+    await client.query(
+      'DELETE FROM leaderboard_overrides WHERE submission_id = ANY($1::uuid[])',
+      [deletable],
+    );
+    await client.query(
+      'DELETE FROM leaderboard_entries WHERE submission_id = ANY($1::uuid[])',
+      [deletable],
+    );
+    // Match rows and replay events stay intact so public match history remains
+    // readable. Only source, runner and compile-log artifacts are purged.
+    await client.query(
+      'DELETE FROM submission_artifacts WHERE submission_id = ANY($1::uuid[])',
+      [deletable],
+    );
+    return {
+      retained: [...keep],
+      pruned: pruneIds,
+      deleted: deletable,
+      deferred: [...deferred],
+      objectKeys: artifacts.rows.map((row) => row.object_key).filter(Boolean),
+    };
+  });
+}
+
+async function listSubmissionOwnerIds(pool) {
+  const result = await pool.query(
+    'SELECT DISTINCT user_id FROM submissions ORDER BY user_id',
+  );
+  return result.rows.map((row) => row.user_id);
+}
+
 async function getSubmission(pool, id, userId) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.name, s.status, s.is_current, s.compile_log,
@@ -265,7 +374,7 @@ async function getSubmission(pool, id, userId) {
                 AND m.status IN ('FINISHED', 'RUNTIME_FAILED')) AS match_completed
        FROM submissions s
        JOIN submission_artifacts a ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.id = $1 AND s.user_id = $2`,
+      WHERE s.id = $1 AND s.user_id = $2 AND s.history_deleted_at IS NULL`,
     [id, userId],
   );
   return result.rows[0] || null;
@@ -279,7 +388,7 @@ async function listSubmissions(pool, userId, limit, offset) {
        FROM submissions s
        LEFT JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'SOURCE'
-      WHERE s.user_id = $1
+      WHERE s.user_id = $1 AND s.history_deleted_at IS NULL
       ORDER BY s.created_at DESC, s.id DESC
       LIMIT $2 OFFSET $3`,
     [userId, limit, offset],
@@ -441,7 +550,9 @@ async function listRankedAlgorithms(pool) {
       WHERE s.is_current = true AND s.deleted_at IS NULL
         AND s.status = 'FINISHED'
         AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
+        AND (a.byte_size IS NULL OR a.byte_size <= $1)
       ORDER BY s.created_at ASC, s.id ASC`,
+    [MAX_COMPILED_BYTES],
   );
   return result.rows;
 }
@@ -460,7 +571,9 @@ async function listPendingAlgorithms(pool) {
       WHERE s.deleted_at IS NULL
         AND s.status = 'QUEUED'
         AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
+        AND (a.byte_size IS NULL OR a.byte_size <= $1)
       ORDER BY s.created_at ASC, s.id ASC`,
+    [MAX_COMPILED_BYTES],
   );
   return result.rows;
 }
@@ -474,8 +587,9 @@ async function getCompiledArtifacts(pool, submissionIds) {
        JOIN submission_artifacts a
          ON a.submission_id = s.id AND a.kind = 'COMPILED'
       WHERE s.id = ANY($1::uuid[]) AND s.deleted_at IS NULL
-        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)`,
-    [submissionIds],
+        AND (a.uploaded_at IS NOT NULL OR a.payload IS NOT NULL)
+        AND (a.byte_size IS NULL OR a.byte_size <= $2)`,
+    [submissionIds, MAX_COMPILED_BYTES],
   );
   return result.rows;
 }
@@ -537,7 +651,7 @@ async function confirmSubmission(pool, { id, userId, confirmSource }) {
         WHERE id = $1 AND deleted_at IS NULL`,
       [id],
     );
-    return { confirmed: true, status: 'UPLOADED' };
+    return { confirmed: true, status: 'UPLOADED', stagingKey };
   });
 }
 
@@ -1296,6 +1410,8 @@ module.exports = {
   createRegistration,
   ensurePasswordUser,
   createSubmission,
+  pruneSubmissionHistory,
+  listSubmissionOwnerIds,
   getSubmission,
   listSubmissions,
   listUsers,

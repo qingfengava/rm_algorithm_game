@@ -164,6 +164,15 @@ async function restoreArtifactBackups({ pool, storage, repo, logger = console })
   return summary;
 }
 
+async function deletePrunedArtifacts(storage, pruning, logger = console) {
+  for (const objectKey of pruning?.objectKeys || []) {
+    if (typeof storage.deleteObject !== 'function') continue;
+    await storage.deleteObject(objectKey).catch((error) => {
+      logger.warn('submission artifact cleanup failed', { objectKey, error });
+    });
+  }
+}
+
 function createServer({ pool, storage, queue, repo, logger = console }) {
   async function authenticatedUser(request) {
     const match = /^Bearer ([^\s]+)$/.exec(String(request.headers.authorization || ''));
@@ -405,6 +414,16 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
         name: body.name.trim(),
         stagingKey,
       });
+      if (typeof repo.pruneSubmissionHistory === 'function') {
+        try {
+          const pruning = await repo.pruneSubmissionHistory(pool, user.id);
+          await deletePrunedArtifacts(storage, pruning, logger);
+        } catch (error) {
+          // The new upload is already durable. A cleanup failure must not make
+          // the user submit again; the next submission retries pruning.
+          logger.warn('submission history pruning failed', { userId: user.id, error });
+        }
+      }
       sendJson(response, 201, {
         submission: serializeSubmission({
           ...submission, source_size: null, source_uploaded_at: null,
@@ -450,6 +469,15 @@ function createServer({ pool, storage, queue, repo, logger = console }) {
       });
       if (!result) throw new HttpError(404, 'submission_not_found');
       if (result.confirmed) {
+        // The staging key is only needed until confirmation. Removing it
+        // prevents every confirmed version from consuming two object-store
+        // copies of the ZIP. This happens after the database transaction has
+        // committed, so a failed transaction cannot lose the source pointer.
+        if (result.stagingKey && typeof storage.deleteObject === 'function') {
+          await storage.deleteObject(result.stagingKey).catch((error) => {
+            logger.warn('submission staging cleanup failed', { stagingKey: result.stagingKey, error });
+          });
+        }
         // The durable UPLOADED row lets a scheduler recover even if this
         // Redis notification is lost during an API restart.
         try {
@@ -600,6 +628,22 @@ async function start(env = process.env) {
       process.stdout.write(
         `object storage restore: ${restored.restored} restored, ${restored.failed} failed\n`,
       );
+    }
+    // Apply the retention rule to versions that existed before this release.
+    // New submissions run the same cleanup path in createServer; doing this
+    // once at startup avoids leaving old installations over the disk budget.
+    if (typeof db.listSubmissionOwnerIds === 'function' &&
+        typeof db.pruneSubmissionHistory === 'function') {
+      const owners = await db.listSubmissionOwnerIds(pool);
+      for (const ownerId of owners) {
+        try {
+          await deletePrunedArtifacts(
+            storage, await db.pruneSubmissionHistory(pool, ownerId), console,
+          );
+        } catch (error) {
+          console.warn('startup submission history pruning failed', { ownerId, error });
+        }
+      }
     }
     await retry(async () => {
       if (!queue.isReady) {

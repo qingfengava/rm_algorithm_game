@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { MAX_COMPILED_BYTES } = require('../api/limits');
 
 const SUBMISSION_CHANNEL = 'arena:submissions:uploaded';
 
@@ -97,6 +98,14 @@ function createCompileWorker({
           failureReason: result.reason,
         });
         return { status: 'failed', reason: result.reason };
+      }
+      const runnerStat = await fs.stat(runner);
+      if (!runnerStat.isFile() || runnerStat.size > MAX_COMPILED_BYTES) {
+        const error = new Error(
+          `compiled runner is ${runnerStat.size} bytes; maximum is ${MAX_COMPILED_BYTES} bytes`,
+        );
+        error.code = 'COMPILED_ARTIFACT_TOO_LARGE';
+        throw error;
       }
       const objectKey = `submissions/${submission.id}/runner`;
       const byteSize = await storage.uploadFile(objectKey, runner, 'application/octet-stream');

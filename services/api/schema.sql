@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     compile_log text,
     failure_reason text,
     deleted_at timestamptz,
+    history_deleted_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -54,10 +55,13 @@ CREATE INDEX IF NOT EXISTS submissions_status_created_idx
 
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_current boolean NOT NULL DEFAULT false;
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS history_deleted_at timestamptz;
 CREATE INDEX IF NOT EXISTS submissions_current_idx
     ON submissions(is_current, status, created_at);
 CREATE INDEX IF NOT EXISTS submissions_active_idx
     ON submissions(deleted_at, created_at DESC);
+CREATE INDEX IF NOT EXISTS submissions_history_idx
+    ON submissions(user_id, history_deleted_at, created_at DESC);
 
 -- A user owns at most two live submissions: the ranked version
 -- (is_current = true) and one candidate that is still being compiled or

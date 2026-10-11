@@ -51,6 +51,7 @@ function fixture() {
       submissions.set(id, row);
       return row;
     },
+    async pruneSubmissionHistory() { return { objectKeys: [] }; },
     async getSubmission(_pool, id, userId) {
       const row = submissions.get(id);
       return row?.user_id === userId ? row : null;

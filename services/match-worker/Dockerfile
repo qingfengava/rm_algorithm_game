@@ -21,7 +21,7 @@ RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
     && npm cache clean --force
 
 COPY services/match-worker/index.js ./index.js
-COPY services/api/db.js services/api/schema.sql services/api/storage.js ./api/
+COPY services/api/db.js services/api/schema.sql services/api/storage.js services/api/limits.js ./api/
 COPY --from=engine-build /src/build/arena_match_demo ./arena_match_demo
 
 USER node

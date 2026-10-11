@@ -8,7 +8,7 @@ RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
     --fetch-retry-maxtimeout=120000 --maxsockets=1 \
     && npm cache clean --force
 
-COPY server.js db.js storage.js provision_user.js schema.sql ./
+COPY server.js db.js storage.js limits.js provision_user.js schema.sql ./
 COPY test ./test
 
 USER node

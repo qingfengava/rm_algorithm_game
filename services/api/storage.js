@@ -6,13 +6,14 @@ const {
   CopyObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
+  DeleteObjectCommand,
   PutBucketCorsCommand,
 } = require('@aws-sdk/client-s3');
 const fs = require('node:fs/promises');
 const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { MAX_SOURCE_BYTES } = require('./limits');
 
-const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
 const UPLOAD_EXPIRY_SECONDS = 600;
 const DOWNLOAD_EXPIRY_SECONDS = 300;
 
@@ -196,6 +197,17 @@ function createStorage(env = process.env) {
     }
   }
 
+  async function deleteObject(key) {
+    if (!key) return false;
+    try {
+      await internal.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+      return true;
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+  }
+
   async function health() {
     await internal.send(new HeadBucketCommand({ Bucket: bucket }));
     return true;
@@ -212,6 +224,7 @@ function createStorage(env = process.env) {
     uploadBuffer,
     uploadFile,
     objectExists,
+    deleteObject,
     health,
   };
 }
